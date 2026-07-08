@@ -1,0 +1,15 @@
+# 環境・秘密情報
+.venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# ユーザーコンテンツ（編集対象ノートはリポジトリに含めない）
+workspace/
+
+# ベンダリングした Monaco（scripts/fetch_monaco.py で再取得できる）
+static/vendor/

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NoteWithPixie</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">🧚 NoteWithPixie</div>
+    <div class="file-info">
+      <span id="current-file">（ファイル未選択）</span>
+      <button id="save-btn" title="保存 (Ctrl+S)">保存</button>
+      <span id="save-state"></span>
+    </div>
+    <div class="model-info">model: <span id="model-name">…</span></div>
+  </header>
+
+  <main id="split">
+    <!-- 左：執筆エディタ -->
+    <section id="left-pane">
+      <div id="editor"></div>
+      <div id="left-toolbar">
+        <button id="note-btn" title="選択行に付箋を貼る">📌 付箋</button>
+        <span id="sel-info" class="hint">テキストを選択してAIに送れます</span>
+      </div>
+    </section>
+
+    <div id="divider" title="ドラッグで幅を調整"></div>
+
+    <!-- 右：コンテキスト & チャット -->
+    <section id="right-pane">
+      <div id="filemgr">
+        <div class="section-head">
+          <span>ファイル（コンテキスト）</span>
+          <input id="file-search" type="search" placeholder="🔍 全文検索…" />
+        </div>
+        <ul id="file-list"></ul>
+        <div id="search-results" class="hidden"></div>
+      </div>
+
+      <div id="chat">
+        <div id="messages"></div>
+        <div id="composer">
+          <div id="chip-bar">
+            <span id="sel-chip" class="chip hidden">選択テキスト添付</span>
+          </div>
+          <textarea id="chat-input" rows="3"
+            placeholder="例）左の選択部分を、チェックした資料を参考にもう少し技術的な表現に。"></textarea>
+          <div class="composer-actions">
+            <span class="hint">Ctrl+Enter で送信</span>
+            <button id="send-btn">送信</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Monaco ローダ（ローカルにベンダリングした vs を優先、無ければCDN） -->
+  <script>
+    window.__MONACO_VS__ = "/static/vendor/monaco/min/vs";
+  </script>
+  <script src="/static/js/monaco-loader.js"></script>
+  <script src="/static/js/app.js" type="module"></script>
+</body>
+</html>
