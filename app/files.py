@@ -19,16 +19,60 @@ def safe_path(rel: str) -> Path:
     return p
 
 
+def _hidden(parts: tuple[str, ...]) -> bool:
+    """無視ディレクトリ配下、またはドット始まり（.pixie_notes.json 等）を隠す。"""
+    return any(part in IGNORE_DIRS or part.startswith(".") for part in parts)
+
+
 def list_files() -> list[dict]:
-    """ワークスペース内のテキストファイルをツリー用のフラットリストで返す。"""
+    """ワークスペース内のファイルとフォルダをフラットリストで返す（type 付き）。"""
     out: list[dict] = []
     for p in sorted(WORKSPACE.rglob("*")):
-        if any(part in IGNORE_DIRS for part in p.relative_to(WORKSPACE).parts):
+        rel_parts = p.relative_to(WORKSPACE).parts
+        if _hidden(rel_parts):
             continue
-        if p.is_file() and p.suffix.lower() in TEXT_EXTS:
-            rel = p.relative_to(WORKSPACE).as_posix()
-            out.append({"path": rel, "size": p.stat().st_size})
+        rel = p.relative_to(WORKSPACE).as_posix()
+        if p.is_dir():
+            out.append({"path": rel, "type": "dir"})
+        elif p.is_file() and p.suffix.lower() in TEXT_EXTS:
+            out.append({"path": rel, "type": "file", "size": p.stat().st_size})
     return out
+
+
+def create(rel: str, kind: str) -> None:
+    """空ファイルまたはフォルダを作成する。既存なら ValueError。"""
+    p = safe_path(rel)
+    if p.exists():
+        raise ValueError(f"既に存在します: {rel}")
+    if kind == "dir":
+        p.mkdir(parents=True)
+    else:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("", encoding="utf-8")
+
+
+def rename(src: str, dst: str) -> None:
+    """ファイル/フォルダの改名・移動（ワークスペース内のみ）。"""
+    ps, pd = safe_path(src), safe_path(dst)
+    if not ps.exists():
+        raise FileNotFoundError(src)
+    if pd.exists():
+        raise ValueError(f"移動先が既に存在します: {dst}")
+    pd.parent.mkdir(parents=True, exist_ok=True)
+    ps.rename(pd)
+
+
+def delete(rel: str) -> None:
+    """ファイルを削除。フォルダは空の場合のみ削除（誤爆防止）。"""
+    p = safe_path(rel)
+    if not p.exists():
+        raise FileNotFoundError(rel)
+    if p.is_dir():
+        if any(p.iterdir()):
+            raise ValueError("フォルダが空ではありません。中のファイルを先に削除・移動してください。")
+        p.rmdir()
+    else:
+        p.unlink()
 
 
 def read_file(rel: str) -> str:

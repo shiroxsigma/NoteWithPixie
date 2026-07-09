@@ -21,6 +21,18 @@
     <!-- 左：執筆エディタ -->
     <section id="left-pane">
       <div id="editor"></div>
+
+      <!-- 差分プレビュー（反映前の確認）。左=現在 / 右=提案（右は編集可）。 -->
+      <div id="diff-overlay" class="hidden">
+        <div id="diff-bar">
+          <span id="diff-label">差分プレビュー：左＝現在 ／ 右＝提案（右は編集して調整可）</span>
+          <span class="spacer"></span>
+          <button id="diff-apply" class="apply-btn">✓ 適用</button>
+          <button id="diff-cancel">キャンセル</button>
+        </div>
+        <div id="diff-editor"></div>
+      </div>
+
       <div id="left-toolbar">
         <button id="note-btn" title="選択行に付箋を貼る">📌 付箋</button>
         <span id="sel-info" class="hint">テキストを選択してAIに送れます</span>
@@ -34,6 +46,10 @@
       <div id="filemgr">
         <div class="section-head">
           <span>ファイル（コンテキスト）</span>
+          <span class="fm-actions">
+            <button id="new-file-btn" title="新規ファイル">📄+</button>
+            <button id="new-folder-btn" title="新規フォルダ">📁+</button>
+          </span>
           <input id="file-search" type="search" placeholder="🔍 全文検索…" />
         </div>
         <ul id="file-list"></ul>

@@ -5,6 +5,7 @@ AnythingWithPixie のエンジンは持ち込まず、OpenAI 互換 function cal
 
 イベントは dict で yield する:
   {"t": str}  本文トークン（チャット本文・履歴に含める）
+  {"r": str}  思考（reasoning）トークン（表示のみ、本文には含めない）
   {"s": str}  ツール実行などのステータス行（表示のみ、本文には含めない）
 """
 from __future__ import annotations
@@ -41,9 +42,10 @@ async def run_agent(
     for _step in range(settings.agent_max_steps):
         tool_calls: list[dict] = []
         content = ""
-        async for tok in _stream_step(messages, tool_calls, use_tools=True):
-            content += tok
-            yield {"t": tok}
+        async for ev in _stream_step(messages, tool_calls, use_tools=True):
+            if "t" in ev:
+                content += ev["t"]
+            yield ev
 
         if not tool_calls:
             if content.strip():
@@ -56,8 +58,8 @@ async def run_agent(
                 "content": "（システム: 応答が空でした。ツールを使わず、これまでの情報で回答してください）",
             })
             retry_sink: list[dict] = []
-            async for tok in _stream_step(messages, retry_sink, use_tools=False):
-                yield {"t": tok}
+            async for ev in _stream_step(messages, retry_sink, use_tools=False):
+                yield ev
             return
 
         messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
@@ -90,8 +92,8 @@ async def run_agent(
         "content": "（システム: ツール使用の上限に達しました。ここまでに得た情報だけで最終回答をまとめてください）",
     })
     final_sink: list[dict] = []
-    async for tok in _stream_step(messages, final_sink, use_tools=False):
-        yield {"t": tok}
+    async for ev in _stream_step(messages, final_sink, use_tools=False):
+        yield ev
 
 
 def _fmt_args(args: dict | None) -> str:
@@ -111,8 +113,8 @@ async def _stream_step(
     messages: list[dict],
     tool_sink: list[dict],
     use_tools: bool,
-) -> AsyncGenerator[str, None]:
-    """chat/completions を1回ストリーミング実行。本文トークンを yield し、
+) -> AsyncGenerator[dict, None]:
+    """chat/completions を1回ストリーミング実行。{"t"|"r": str} イベントを yield し、
     tool_calls は delta を index ごとに組み立てて tool_sink に格納する。"""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     payload: dict = {
@@ -131,7 +133,7 @@ async def _stream_step(
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode("utf-8", "replace")
-                    yield f"\n\n> ⚠️ LLM エラー ({resp.status_code}): {body[:300]}"
+                    yield {"t": f"\n\n> ⚠️ LLM エラー ({resp.status_code}): {body[:300]}"}
                     return
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -143,9 +145,12 @@ async def _stream_step(
                         delta = json.loads(data)["choices"][0]["delta"]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+                    r = llm._delta_reasoning(delta)
+                    if r:
+                        yield {"r": r}
                     tok = delta.get("content")
                     if tok:
-                        yield tok
+                        yield {"t": tok}
                     for tc in delta.get("tool_calls") or []:
                         slot = acc.setdefault(
                             tc.get("index", 0), {"id": "", "name": "", "arguments": ""}
@@ -158,11 +163,11 @@ async def _stream_step(
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"]
     except httpx.HTTPError as e:
-        yield (
+        yield {"t": (
             f"\n\n> ⚠️ LLM バックエンドに接続できません（{url}）。\n"
             f"> Ollama / LM Studio が起動しているか、.env の NWP_LLM_BASE_URL を確認してください。\n"
             f"> 詳細: {type(e).__name__}: {e}"
-        )
+        )}
         return
 
     # OpenAI 互換の tool_calls 形式へ整形（id 欠落バックエンドには合成 id を振る）

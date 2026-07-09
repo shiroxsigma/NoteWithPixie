@@ -10,7 +10,7 @@ AI の修正案をワンクリックでエディタの選択範囲へ差分反�
 - **Copilot 相談（`ask_copilot`）**: [PrayLight](../PrayLight) 経由で Microsoft Copilot（Web版）に単発質問し、回答をチャットに取り込める（要: PrayLight 側でブラウザ起動＋ログイン）。
 - **OpenAI 互換バックエンド**: Ollama / LM Studio / llama.cpp server を `.env` の URL 切替だけで利用。
 - **爆速ファイル参照**: ripgrep によるワークスペース全文検索（rg 未導入時は Python でフォールバック）。
-- **確実な差分反映**: AI 応答内の <code>```apply</code> ブロックのみを抽出して選択範囲へ適用するため、挨拶や解説がエディタに混入しない。
+- **確実な差分反映**: AI は <code>```search</code>/<code>```replace</code> ペア（部分編集・複数箇所可）か <code>```apply</code>（全置換）で提案。適用前に Monaco DiffEditor の**差分プレビュー**（現在 vs 提案、右側は編集可）で確認してから反映。挨拶や解説がエディタに混入しない。
 - **インライン付箋**: 行に📌メモを貼れる。ローカル JSON に永続化。
 
 ## セットアップ
@@ -41,6 +41,7 @@ app/            FastAPI バックエンド
   agent.py      軽量エージェントループ（function calling / SSE イベント）
   tools.py      エージェント用ツール（read系 + ask_copilot）
   llm.py        OpenAI 互換ストリーミング + プロンプト設計（非エージェント時）
+  patch.py      search/replace 提案の適用計算（AnythingWithPixie のファジーマッチを文字列ベースに移植）
   files.py      ワークスペース安全アクセス
   search.py     ripgrep ラッパ
   config.py     設定（NWP_* / .env）
@@ -69,10 +70,9 @@ workspace/      編集対象ファイル置き場（この外は触れない）
 - **AnythingWithPixie** = エージェント CLI（Core）。将来ここからループ骨格を `pixie-core` として切り出し、本アプリの `agent.py` を置き換える構想（Phase 1）。現状の `agent.py` はその場つなぎの最小実装（Phase 0）。
 - **PrayLight** = Copilot 単発取得 CLI。本アプリからは subprocess として利用するだけで、リポジトリは独立。
 
-## 設計メモ：モードA/B の統合
-元案の「反映時に軽量モデルが選択テキストを再生成（モードB）」は廃止した。
-モードA が生成した確定テキストを <code>```apply</code> フェンスで構造化して返し、
-フロントがそれを厳密抽出して置換するため、2 回目の LLM 呼び出しが不要になり
-**高速・決定的・幻覚なし**になる。全文書の複数箇所編集が必要になったら
-検索/置換ブロック方式へ拡張するのが次の一手。
-```
+## 設計メモ：反映フロー（ハイブリッド方式）
+- モデルには unified diff を出させない（小型モデルでは記法が不安定・Markdown の `- ` と衝突）。
+- 提案フォーマットは2つ: <code>```search</code>/<code>```replace</code> ペア（部分編集・複数箇所・長文に強い）と <code>```apply</code>（選択範囲の全置換）。
+- search/replace の適用計算は `/api/patch` がサーバ側で行う（L1 完全一致 → L2 空白正規化 → L3 difflib ファジー。曖昧なら安全に失敗しヒントを返す）。**ファイルには書かない**。
+- 適用はフロントの差分プレビュー（Monaco DiffEditor）で人間が確認・調整してからワンクリック。エージェントに書き込みツールを与えない原則はそのまま。
+- `app/patch.py` は AnythingWithPixie の `_compute_search_and_replace_content` / `_fuzzy_apply` の文字列ベース移植。Phase 1 の pixie-core 切り出し候補。

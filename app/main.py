@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import agent, files, llm, search
+from . import agent, files, llm, patch, search
 from .config import WORKSPACE, settings
 
 BASE = Path(__file__).resolve().parent.parent
@@ -48,6 +48,30 @@ class SaveReq(BaseModel):
     content: str
 
 
+class FsCreateReq(BaseModel):
+    path: str
+    kind: str = "file"  # "file" | "dir"
+
+
+class FsRenameReq(BaseModel):
+    src: str
+    dst: str
+
+
+class FsDeleteReq(BaseModel):
+    path: str
+
+
+class PatchEdit(BaseModel):
+    search: str
+    replace: str
+
+
+class PatchReq(BaseModel):
+    base: str
+    edits: list[PatchEdit]
+
+
 # --- ファイル API -------------------------------------------------------------
 @app.get("/api/files")
 def api_files():
@@ -73,9 +97,66 @@ def api_write(req: SaveReq):
         raise HTTPException(400, str(e))
 
 
+@app.post("/api/fs/create")
+def api_fs_create(req: FsCreateReq):
+    try:
+        files.create(req.path, req.kind)
+        return {"ok": True}
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/fs/rename")
+def api_fs_rename(req: FsRenameReq):
+    try:
+        files.rename(req.src, req.dst)
+    except FileNotFoundError:
+        raise HTTPException(404, "not found")
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e))
+    _rewrite_notes_on_rename(req.src, req.dst)
+    return {"ok": True}
+
+
+@app.post("/api/fs/delete")
+def api_fs_delete(req: FsDeleteReq):
+    try:
+        files.delete(req.path)
+        return {"ok": True}
+    except FileNotFoundError:
+        raise HTTPException(404, "not found")
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e))
+
+
+def _rewrite_notes_on_rename(src: str, dst: str) -> None:
+    """改名・移動に合わせて付箋JSONのキー（ファイルパス）を追従させる。
+    フォルダ改名なら配下ファイルのキーもプレフィックス書き換え。"""
+    if not NOTES_FILE.exists():
+        return
+    data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    changed = False
+    for key in list(data.keys()):
+        if key == src:
+            data[dst] = data.pop(key)
+            changed = True
+        elif key.startswith(src + "/"):
+            data[dst + key[len(src):]] = data.pop(key)
+            changed = True
+    if changed:
+        NOTES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @app.get("/api/search")
 def api_search(q: str):
     return {"results": search.search(q)}
+
+
+@app.post("/api/patch")
+def api_patch(req: PatchReq):
+    """search/replace 提案を base テキストへ適用した結果を計算して返す。
+    ファイルには一切書かない — 適用はフロントの差分プレビュー確認後。"""
+    return patch.apply_edits(req.base, [e.model_dump() for e in req.edits])
 
 
 # --- 付箋（インラインコメント）の永続化 ---------------------------------------
@@ -108,14 +189,14 @@ async def api_chat(req: ChatReq):
     context = [{"path": c.path, "content": c.content} for c in req.context_files]
 
     async def gen():
-        # SSE: {"t": 本文トークン} / {"s": ツール実行ステータス} を JSON でくるんで送る
+        # SSE: {"t": 本文} / {"r": 思考} / {"s": ツールステータス} を JSON でくるんで送る
         if settings.agent_mode:
-            async for ev in agent.run_agent(req.message, req.selection, context, req.history):
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            source = agent.run_agent(req.message, req.selection, context, req.history)
         else:
             messages = llm.build_messages(req.message, req.selection, context, req.history)
-            async for tok in llm.stream_chat(messages):
-                yield f"data: {json.dumps({'t': tok}, ensure_ascii=False)}\n\n"
+            source = llm.stream_chat(messages)
+        async for ev in source:
+            yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

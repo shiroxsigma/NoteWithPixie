@@ -9,6 +9,10 @@ const state = {
   notes: [],               // [{line, text}]
   history: [],             // chat history [{role, content}]
   streaming: false,
+  pendingTarget: null,     // 反映先として追跡中の選択範囲（1つだけ）
+  fsEntries: [],           // /api/files の結果 [{path, type, size?}]
+  collapsedDirs: new Set(),// 折りたたみ中のフォルダ
+  checkedFiles: new Set(), // コンテキストに含めるファイル（再描画をまたいで保持）
 };
 
 // ---- 起動 -------------------------------------------------------------------
@@ -56,25 +60,238 @@ async function loadModel() {
   } catch { $("model-name").textContent = "未接続"; }
 }
 
-// ---- ファイル一覧 -----------------------------------------------------------
+// ---- ファイル一覧（ツリー表示 + ファイル操作） --------------------------------
 async function loadFileList() {
   const { files } = await (await fetch("/api/files")).json();
+  state.fsEntries = files;
+  // 消えたファイルはチェック集合からも掃除する
+  const alive = new Set(files.filter((f) => f.type === "file").map((f) => f.path));
+  for (const p of [...state.checkedFiles]) if (!alive.has(p)) state.checkedFiles.delete(p);
+  renderFileTree();
+}
+
+// 祖先フォルダのどれかが折りたたまれていたら非表示
+function isHiddenByCollapse(parentPath) {
+  if (!parentPath) return false;
+  let cur = "";
+  for (const part of parentPath.split("/")) {
+    cur = cur ? cur + "/" + part : part;
+    if (state.collapsedDirs.has(cur)) return true;
+  }
+  return false;
+}
+
+function renderFileTree() {
   const ul = $("file-list");
   ul.innerHTML = "";
-  for (const f of files) {
+  for (const f of state.fsEntries) {
+    const parts = f.path.split("/");
+    if (isHiddenByCollapse(parts.slice(0, -1).join("/"))) continue;
+
     const li = document.createElement("li");
     li.dataset.path = f.path;
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.title = "チャットのコンテキストに含める";
-    cb.addEventListener("click", (e) => e.stopPropagation());
-    const name = document.createElement("span");
-    name.className = "fname";
-    name.textContent = f.path;
-    li.append(cb, name);
-    li.addEventListener("click", () => openFile(f.path));
+    li.dataset.type = f.type;
+    li.style.paddingLeft = 8 + (parts.length - 1) * 16 + "px";
+    setupDragDrop(li, f);
+
+    if (f.type === "dir") {
+      li.classList.add("dir");
+      const icon = document.createElement("span");
+      icon.textContent = state.collapsedDirs.has(f.path) ? "📁" : "📂";
+      const name = document.createElement("span");
+      name.className = "fname";
+      name.textContent = parts[parts.length - 1];
+      li.append(icon, name);
+      li.addEventListener("click", () => {
+        if (state.collapsedDirs.has(f.path)) state.collapsedDirs.delete(f.path);
+        else state.collapsedDirs.add(f.path);
+        renderFileTree();
+      });
+    } else {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.title = "チャットのコンテキストに含める";
+      cb.checked = state.checkedFiles.has(f.path);
+      cb.addEventListener("click", (e) => e.stopPropagation());
+      cb.addEventListener("change", () => {
+        if (cb.checked) state.checkedFiles.add(f.path);
+        else state.checkedFiles.delete(f.path);
+      });
+      const name = document.createElement("span");
+      name.className = "fname";
+      name.textContent = parts[parts.length - 1];
+      name.title = f.path;
+      li.append(cb, name);
+      li.classList.toggle("active", f.path === state.currentFile);
+      li.addEventListener("click", () => openFile(f.path));
+    }
+    li.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openFsMenu(e, f);
+    });
     ul.appendChild(li);
   }
+}
+
+// ドラッグ&ドロップ: ファイル/フォルダをフォルダへ移動。ルート（一覧の余白）へ落とすと最上位へ。
+function setupDragDrop(li, entry) {
+  li.draggable = true;
+  li.addEventListener("dragstart", (e) => {
+    _dragging = entry.path;
+    e.dataTransfer.setData("text/plain", entry.path);
+    e.dataTransfer.effectAllowed = "move";
+    li.classList.add("dragging");
+  });
+  li.addEventListener("dragend", () => {
+    _dragging = null;
+    li.classList.remove("dragging");
+    document.querySelectorAll("#file-list li.drop-target").forEach((x) => x.classList.remove("drop-target"));
+  });
+
+  if (entry.type !== "dir") return;  // ドロップ先はフォルダのみ（ルートは ul が受ける）
+  li.addEventListener("dragover", (e) => {
+    const src = _dragging;
+    if (src === null || src === entry.path) return;
+    if (entry.path.startsWith(src + "/")) return;  // 自分の子孫の中へは不可
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    li.classList.add("drop-target");
+  });
+  li.addEventListener("dragleave", () => li.classList.remove("drop-target"));
+  li.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    li.classList.remove("drop-target");
+    const src = e.dataTransfer.getData("text/plain") || _dragging;
+    if (src && src !== entry.path) moveIntoDir(src, entry.path);
+  });
+}
+
+// dragover 中は getData が空になるブラウザがあるため、進行中パスを保持しておく。
+let _dragging = null;
+
+// 一覧の余白（ul）へのドロップ = 最上位フォルダへ移動。一度だけ結線する。
+function setupRootDrop() {
+  const ul = $("file-list");
+  ul.addEventListener("dragover", (e) => {
+    if (_dragging === null) return;
+    if (e.target.closest("li")) return;  // li 上は各 li のハンドラに任せる
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    ul.classList.add("drop-root");
+  });
+  ul.addEventListener("dragleave", (e) => {
+    if (!ul.contains(e.relatedTarget)) ul.classList.remove("drop-root");
+  });
+  ul.addEventListener("drop", (e) => {
+    ul.classList.remove("drop-root");
+    if (e.target.closest("li")) return;
+    e.preventDefault();
+    const src = e.dataTransfer.getData("text/plain") || _dragging;
+    if (src) moveIntoDir(src, "");  // ルートへ
+  });
+}
+
+// --- 右クリックメニュー ---
+function closeFsMenu() { document.getElementById("fs-menu")?.remove(); }
+
+function openFsMenu(e, entry) {
+  closeFsMenu();
+  const menu = document.createElement("div");
+  menu.id = "fs-menu";
+  const add = (label, fn) => {
+    const it = document.createElement("div");
+    it.className = "fs-menu-item";
+    it.textContent = label;
+    it.addEventListener("click", () => { closeFsMenu(); fn(); });
+    menu.appendChild(it);
+  };
+  if (entry.type === "dir") {
+    add("📄 中に新規ファイル", () => createEntry("file", entry.path + "/"));
+    add("📁 中に新規フォルダ", () => createEntry("dir", entry.path + "/"));
+  }
+  add("✏️ 名前変更・移動", () => renameEntry(entry));
+  add("🗑️ 削除", () => deleteEntry(entry));
+  menu.style.left = e.pageX + "px";
+  menu.style.top = e.pageY + "px";
+  document.body.appendChild(menu);
+}
+
+// --- ファイル操作 ---
+async function fsPost(url, body) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert("⚠️ " + (err.detail || resp.statusText));
+    return false;
+  }
+  return true;
+}
+
+async function createEntry(kind, prefix = "") {
+  const label = kind === "dir" ? "新規フォルダ名（例: docs/資料）" : "新規ファイル名（例: docs/note.md）";
+  const name = prompt(label, prefix);
+  if (!name || !name.trim() || name.trim() === prefix.trim()) return;
+  const path = name.trim().replace(/\\/g, "/");
+  if (!(await fsPost("/api/fs/create", { path, kind }))) return;
+  if (kind === "dir") state.collapsedDirs.delete(path);
+  await loadFileList();
+  if (kind === "file") await openFile(path);
+}
+
+async function renameEntry(entry) {
+  const dst = prompt("新しいパス（フォルダに入れるには docs/名前.md のように）", entry.path);
+  if (!dst || !dst.trim() || dst.trim() === entry.path) return;
+  await moveEntry(entry, dst.trim().replace(/\\/g, "/"));
+}
+
+// entry を新パス dst へ移動/改名し、開いているファイル・チェック集合を追従させる。
+// rename と drag&drop の共通処理。
+async function moveEntry(entry, dst) {
+  if (!dst || dst === entry.path) return;
+  // フォルダを自分自身の中へは移動できない
+  if (entry.type === "dir" && (dst === entry.path || dst.startsWith(entry.path + "/"))) {
+    alert("⚠️ フォルダを自分自身の中へは移動できません。");
+    return;
+  }
+  if (!(await fsPost("/api/fs/rename", { src: entry.path, dst }))) return;
+  const remap = (p) => {
+    if (p === entry.path) return dst;
+    if (entry.type === "dir" && p.startsWith(entry.path + "/")) return dst + p.slice(entry.path.length);
+    return p;
+  };
+  if (state.currentFile) {
+    const np = remap(state.currentFile);
+    if (np !== state.currentFile) { state.currentFile = np; $("current-file").textContent = np; }
+  }
+  state.checkedFiles = new Set([...state.checkedFiles].map(remap));
+  await loadFileList();
+}
+
+// ドロップ先フォルダ（空文字＝ルート）へ entry を移動する。
+async function moveIntoDir(srcPath, dstDir) {
+  const entry = state.fsEntries.find((f) => f.path === srcPath);
+  if (!entry) return;
+  const base = srcPath.split("/").pop();
+  const dst = dstDir ? dstDir + "/" + base : base;
+  if (dst === srcPath) return;                    // 既に同じ場所
+  if (srcPath.split("/").slice(0, -1).join("/") === dstDir) return;  // 親が変わらない
+  await moveEntry(entry, dst);
+}
+
+async function deleteEntry(entry) {
+  if (!confirm(`「${entry.path}」を削除しますか？`)) return;
+  if (!(await fsPost("/api/fs/delete", { path: entry.path }))) return;
+  if (state.currentFile === entry.path) {
+    state.currentFile = null;
+    $("current-file").textContent = "（ファイル未選択）";
+  }
+  state.checkedFiles.delete(entry.path);
+  await loadFileList();
 }
 
 async function openFile(path) {
@@ -84,8 +301,7 @@ async function openFile(path) {
   state.editor.setValue(r.content);
   setDirty(false);
   $("current-file").textContent = path;
-  document.querySelectorAll("#file-list li").forEach((li) =>
-    li.classList.toggle("active", li.dataset.path === path));
+  renderFileTree();
   await loadNotes();
 }
 
@@ -106,8 +322,6 @@ async function saveFile() {
   $("save-state").textContent = "保存済";
   setTimeout(() => ($("save-state").textContent = ""), 1500);
   await loadFileList();
-  document.querySelectorAll("#file-list li").forEach((li) =>
-    li.classList.toggle("active", li.dataset.path === state.currentFile));
 }
 
 function setDirty(v) {
@@ -212,12 +426,7 @@ async function runSearch(q) {
 
 // ---- チャット ---------------------------------------------------------------
 function collectContext() {
-  const files = [];
-  document.querySelectorAll("#file-list li").forEach((li) => {
-    const cb = li.querySelector("input[type=checkbox]");
-    if (cb.checked) files.push(li.dataset.path);
-  });
-  return files;
+  return [...state.checkedFiles];
 }
 
 async function sendChat() {
@@ -238,9 +447,10 @@ async function sendChat() {
 
   addMessage("user", message);
   const assistantEl = addMessage("assistant", "");
+  const ui = beginAssistantStream(assistantEl);  // 応答待ちインジケータ + 思考ボックス
   state.streaming = true;
+  $("send-btn").disabled = true;
 
-  let full = "";
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
@@ -261,37 +471,194 @@ async function sendChat() {
         if (line === "[DONE]") continue;
         try {
           const ev = JSON.parse(line);
-          if (ev.t) { full += ev.t; assistantEl.querySelector(".body").textContent = full; scrollMessages(); }
+          if (ev.t) ui.onToken(ev.t);
+          if (ev.r) ui.onReason(ev.r);
           if (ev.s) addToolStatus(assistantEl, ev.s);  // ツール実行ログ（本文・履歴には含めない）
         } catch {}
       }
     }
   } catch (e) {
-    full += "\n\n> ⚠️ 接続エラー: " + e.message;
-    assistantEl.querySelector(".body").textContent = full;
+    ui.onToken("\n\n> ⚠️ 接続エラー: " + e.message);
   }
+  const visible = ui.finish();  // 思考部分を除いた本文（履歴・反映の対象）
   state.streaming = false;
+  $("send-btn").disabled = false;
 
   state.history.push({ role: "user", content: message });
-  state.history.push({ role: "assistant", content: full });
-  renderApplyBlock(assistantEl, full, applyTarget);
-  if (applyTarget && !assistantEl.querySelector(".apply-box")) applyTarget.coll.clear();
+  state.history.push({ role: "assistant", content: visible });
+
+  // トリガー優先順: search/replace ペア（部分編集）→ ```apply（全置換）→ 汎用挿入
+  const edits = extractEdits(visible);
+  if (edits.length) {
+    renderPatchAction(assistantEl, visible, edits);
+  } else {
+    const hasApply = renderApplyBlock(assistantEl, visible, applyTarget);
+    if (!hasApply && visible.trim()) addInsertAction(assistantEl, visible, applyTarget);
+  }
+}
+
+// 本文先頭の <think>...</think>（qwen 系が content に混ぜる形式）を分離する。
+function splitThink(s) {
+  const m = s.match(/^\s*<think>([\s\S]*?)(?:<\/think>\s*([\s\S]*))?$/);
+  if (m) return { think: m[1], visible: m[2] ?? "" };
+  return { think: "", visible: s };
+}
+
+// 応答ストリームの表示管理。prefill 待ち → 思考中 → 本文、の3段階で反応を出す。
+function beginAssistantStream(el) {
+  const startedAt = performance.now();
+  let raw = "";      // content トークンの生蓄積（<think> を含みうる）
+  let reason = "";   // reasoning トークンの蓄積
+  let thinkBox = null, thinkBody = null, thinkSummary = null;
+
+  // 待機インジケータ（送信直後から表示）
+  const wait = document.createElement("div");
+  wait.className = "wait-indicator";
+  wait.innerHTML = `<span class="dots"><i></i><i></i><i></i></span><span class="wait-text"></span>`;
+  el.insertBefore(wait, el.querySelector(".body"));
+  const waitText = wait.querySelector(".wait-text");
+  let phase = "prefill";  // prefill -> thinking -> (removed)
+  const timer = setInterval(() => {
+    const sec = ((performance.now() - startedAt) / 1000).toFixed(1);
+    waitText.textContent = phase === "prefill"
+      ? `応答を待っています（prefill 中… ${sec}s）`
+      : `思考中… ${sec}s`;
+    scrollMessages();
+  }, 200);
+  waitText.textContent = "応答を待っています（prefill 中…）";
+
+  function ensureThinkBox() {
+    if (thinkBox) return;
+    thinkBox = document.createElement("details");
+    thinkBox.className = "think-box";
+    thinkBox.open = true;
+    thinkSummary = document.createElement("summary");
+    thinkSummary.textContent = "💭 思考中…";
+    thinkBody = document.createElement("div");
+    thinkBody.className = "think-body";
+    thinkBox.append(thinkSummary, thinkBody);
+    el.insertBefore(thinkBox, el.querySelector(".body"));
+  }
+
+  function render() {
+    const { think, visible } = splitThink(raw);
+    const allThink = (reason + think).trim();
+    if (allThink) { ensureThinkBox(); thinkBody.textContent = allThink; }
+    if (visible.trim()) {
+      if (wait.isConnected) wait.remove();   // 本文が出始めたら待機表示は不要
+      el.querySelector(".body").textContent = visible;
+    } else if (allThink && phase === "prefill") {
+      phase = "thinking";                     // 思考だけ流れている段階
+    }
+    scrollMessages();
+  }
+
+  return {
+    onToken(t) { raw += t; render(); },
+    onReason(r) { reason += r; render(); },
+    finish() {
+      clearInterval(timer);
+      if (wait.isConnected) wait.remove();
+      const { think, visible } = splitThink(raw);
+      const allThink = (reason + think).trim();
+      if (thinkBox) {
+        const sec = ((performance.now() - startedAt) / 1000).toFixed(1);
+        thinkSummary.textContent = `💭 思考ログ（${allThink.length}文字・${sec}s）`;
+        thinkBox.open = false;               // 完了したら折りたたむ（クリックで展開）
+      }
+      return visible;
+    },
+  };
+}
+
+// ```search / ```replace のペアを順に抽出する。
+function extractEdits(text) {
+  const edits = [];
+  const re = /```search\s*\n([\s\S]*?)```\s*\n\s*```replace\s*\n([\s\S]*?)```/g;
+  for (const m of text.matchAll(re)) {
+    edits.push({ search: m[1].replace(/\n$/, ""), replace: m[2].replace(/\n$/, "") });
+  }
+  return edits;
+}
+
+// 部分編集の提案：ボタンを付け、押下でサーバ計算 → 差分プレビュー → 適用。
+function renderPatchAction(el, text, edits) {
+  el.querySelector(".body").textContent =
+    text.replace(/```search\s*\n[\s\S]*?```\s*\n\s*```replace\s*\n[\s\S]*?```/g, "📝 修正案（差分で確認）");
+  const actions = document.createElement("div");
+  actions.className = "apply-actions";
+  const btn = document.createElement("button");
+  btn.className = "apply-btn";
+  btn.textContent = `▶ 差分で反映（${edits.length}箇所）`;
+  btn.addEventListener("click", () => reflectViaPatch(edits, el));
+  actions.appendChild(btn);
+  el.appendChild(actions);
+  scrollMessages();
+}
+
+// search/replace 編集を文書全体に対してサーバで計算し、差分プレビューへ。
+async function reflectViaPatch(edits, msgEl) {
+  const base = state.editor.getModel().getValue();
+  let r;
+  try {
+    const resp = await fetch("/api/patch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base, edits }),
+    });
+    r = await resp.json();
+  } catch (e) {
+    addToolStatus(msgEl, "⚠️ 適用計算に失敗: " + e.message);
+    return;
+  }
+  // 失敗した編集はステータス行で知らせる（ヒント付き）
+  r.results.forEach((res, i) => {
+    if (!res.ok) addToolStatus(msgEl, `⚠️ 修正${i + 1}: ${res.error.split("\n")[0]}`);
+    else if (res.method !== "exact") addToolStatus(msgEl, `ℹ️ 修正${i + 1}: ${res.method} マッチで補正適用`);
+  });
+  if (r.applied === 0) {
+    addToolStatus(msgEl, "⚠️ 適用できる修正がありませんでした。本文が変わっていないか確認してください。");
+    return;
+  }
+  openDiffPreview(base, r.content, (finalText) => {
+    const model = state.editor.getModel();
+    state.editor.executeEdits("pixie-patch",
+      [{ range: model.getFullModelRange(), text: finalText, forceMoveMarkers: true }]);
+    setDirty(true);
+    state.editor.focus();
+  }, `差分プレビュー：${r.applied}/${edits.length} 箇所を適用（右は編集して調整可）`);
 }
 
 // 送信時の選択範囲をデコレーションとして記録。以降の編集に追随する。
 function trackApplyTarget() {
+  if (state.pendingTarget?.coll) state.pendingTarget.coll.clear();  // 前回のハイライトを消す
   const sel = state.editor.getSelection();
-  if (!sel || sel.isEmpty()) return null;
+  if (!sel || sel.isEmpty()) { state.pendingTarget = null; return null; }
   const coll = state.editor.createDecorationsCollection([
     { range: sel, options: { className: "pixie-pending-target" } },
   ]);
-  return { file: state.currentFile, coll };
+  state.pendingTarget = { file: state.currentFile, coll };
+  return state.pendingTarget;
 }
 
-// ```apply ブロックを抽出して「反映」ボタンを付ける
+// 全アシスタントメッセージに付く汎用トリガー。本文を左エディタへ挿入/置換する。
+function addInsertAction(el, text, target) {
+  const actions = document.createElement("div");
+  actions.className = "apply-actions";
+  const btn = document.createElement("button");
+  btn.className = "insert-btn";
+  btn.textContent = "▶ エディタへ反映";
+  btn.title = "このメッセージの提案を差分プレビューで確認してから反映する";
+  btn.addEventListener("click", () => reflectViaDiff(extractProposed(text), target));
+  actions.appendChild(btn);
+  el.appendChild(actions);
+  scrollMessages();
+}
+
+// ```apply ブロックを抽出して「反映」ボタンを付ける。付けたら true。
 function renderApplyBlock(el, text, target) {
   const matches = [...text.matchAll(/```apply\s*\n([\s\S]*?)```/g)];
-  if (!matches.length) return;
+  if (!matches.length) return false;
   const replacement = matches[matches.length - 1][1].replace(/\n$/, "");
 
   // 本文中の apply フェンスは重複表示になるので置き換える
@@ -305,28 +672,90 @@ function renderApplyBlock(el, text, target) {
   actions.className = "apply-actions";
   const btn = document.createElement("button");
   btn.className = "apply-btn";
-  btn.textContent = "▶ 選択範囲へ反映";
-  btn.addEventListener("click", () => applyToEditor(replacement, target));
+  btn.textContent = "▶ 差分で反映";
+  btn.addEventListener("click", () => reflectViaDiff(replacement, target));
   actions.appendChild(btn);
   el.append(box, actions);
   scrollMessages();
+  return true;
 }
 
-// 反映：送信時に記録した範囲を優先して置換。無ければ現在の選択/カーソル位置。
-function applyToEditor(text, target) {
-  let range = state.editor.getSelection();
-  if (target && target.coll) {
-    const tracked = target.coll.getRange(0);
-    if (tracked && target.file === state.currentFile) {
-      range = tracked;
-    } else if (target.file !== state.currentFile &&
-               !confirm(`送信時と違うファイル（${state.currentFile ?? "未保存"}）が開いています。現在のカーソル位置に反映しますか？`)) {
-      return;
-    }
+// メッセージ本文から「反映すべき提案テキスト」を取り出す。
+// 優先: ```apply → diff以外の一般フェンス → ```diff を復元 → 本文そのまま。
+function extractProposed(text) {
+  const apply = [...text.matchAll(/```apply\s*\n([\s\S]*?)```/g)];
+  if (apply.length) return apply[apply.length - 1][1].replace(/\n$/, "");
+  const fence = [...text.matchAll(/```(?!diff\b|search\b|replace\b)[a-zA-Z]*\s*\n([\s\S]*?)```/g)];
+  if (fence.length) return fence[fence.length - 1][1].replace(/\n$/, "");
+  const diff = [...text.matchAll(/```diff\s*\n([\s\S]*?)```/g)];
+  if (diff.length) return diffToAfter(diff[diff.length - 1][1]);
+  return text.trim();
+}
+
+// モデルが万一 unified diff を返した場合のベストエフォート復元（修正後テキスト）。
+function diffToAfter(block) {
+  return block.split("\n")
+    .filter((l) => !/^(-|@@|---|\+\+\+)/.test(l))          // 削除行・ヘッダを落とす
+    .map((l) => (l.startsWith("+") || l.startsWith(" ") ? l.slice(1) : l))
+    .join("\n").replace(/\n$/, "");
+}
+
+// 反映の入口：差分プレビュー（現在 vs 提案）を開き、確認後に適用する。
+function reflectViaDiff(proposed, target) {
+  const range = resolveTargetRange(target);
+  const base = state.editor.getModel().getValueInRange(range);
+  openDiffPreview(base, proposed, (finalText) => {
+    state.editor.executeEdits("pixie-apply", [{ range, text: finalText, forceMoveMarkers: true }]);
+    if (target?.coll) target.coll.clear();
+    setDirty(true);
+    state.editor.focus();
+  });
+}
+
+// 反映先の範囲：送信時に選択があればその範囲、無ければ全文。
+function resolveTargetRange(target) {
+  const model = state.editor.getModel();
+  if (target?.coll && target.file === state.currentFile) {
+    const r = target.coll.getRange(0);
+    if (r) return r;
   }
-  state.editor.executeEdits("pixie-apply", [{ range, text, forceMoveMarkers: true }]);
-  if (target && target.coll) target.coll.clear();
-  state.editor.focus();
+  return model.getFullModelRange();
+}
+
+// --- 差分プレビュー オーバーレイ（Monaco DiffEditor）---
+let diffEditor = null;
+let diffApplyFn = null;
+
+function openDiffPreview(base, proposed, onApply, label) {
+  const m = state.monaco;
+  $("diff-label").textContent = label || "差分プレビュー：左＝現在 ／ 右＝提案（右は編集して調整可）";
+  $("diff-overlay").classList.remove("hidden");
+  if (!diffEditor) {
+    diffEditor = m.editor.createDiffEditor($("diff-editor"), {
+      theme: "vs-dark", automaticLayout: true, renderSideBySide: true,
+      originalEditable: false, readOnly: false,
+      minimap: { enabled: false }, wordWrap: "on", fontSize: 14,
+    });
+  }
+  const original = m.editor.createModel(base, "markdown");
+  const modified = m.editor.createModel(proposed, "markdown");
+  diffEditor.setModel({ original, modified });
+  diffApplyFn = () => {
+    const finalText = diffEditor.getModel().modified.getValue();
+    closeDiffPreview();
+    onApply(finalText);
+  };
+  diffEditor.focus();
+}
+
+function closeDiffPreview() {
+  $("diff-overlay").classList.add("hidden");
+  diffApplyFn = null;
+  if (diffEditor) {
+    const models = diffEditor.getModel();
+    diffEditor.setModel(null);
+    if (models) { models.original.dispose(); models.modified.dispose(); }
+  }
 }
 
 // エージェントのツール実行ステータスを本文の上のログ枠に積む
@@ -370,7 +799,21 @@ function bindUI() {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => runSearch(e.target.value), 250);
   });
+  // ファイル操作
+  $("new-file-btn").addEventListener("click", () => createEntry("file"));
+  $("new-folder-btn").addEventListener("click", () => createEntry("dir"));
+  document.addEventListener("click", closeFsMenu);
+  setupRootDrop();
+  // 差分プレビューの確定/キャンセル（Esc でもキャンセル）
+  $("diff-apply").addEventListener("click", () => { if (diffApplyFn) diffApplyFn(); });
+  $("diff-cancel").addEventListener("click", closeDiffPreview);
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("diff-overlay").classList.contains("hidden")) closeDiffPreview();
+  });
   setupDivider();
+
+  // E2E テスト用の内部フック（module スコープのため明示的に公開）
+  window.__pixie = { state, extractEdits, extractProposed, reflectViaPatch, reflectViaDiff, openDiffPreview, splitThink, moveIntoDir, moveEntry };
 }
 
 function setupDivider() {

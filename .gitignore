@@ -13,3 +13,7 @@ workspace/
 
 # ベンダリングした Monaco（scripts/fetch_monaco.py で再取得できる）
 static/vendor/
+
+# 貼り付けたスクリーンショット等
+スクリーンショット*.png
+*.screenshot.png

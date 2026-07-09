@@ -44,8 +44,22 @@ button:active { transform: translateY(1px); }
 
 /* --- split layout --- */
 #split { flex: 1; display: flex; min-height: 0; }
-#left-pane { display: flex; flex-direction: column; min-width: 320px; flex: 1 1 55%; }
+#left-pane { position: relative; display: flex; flex-direction: column; min-width: 320px; flex: 1 1 55%; }
 #editor { flex: 1; min-height: 0; }
+
+/* --- 差分プレビュー オーバーレイ --- */
+#diff-overlay {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+}
+#diff-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--muted);
+}
+#diff-bar .spacer { flex: 1; }
+#diff-editor { flex: 1; min-height: 0; }
 #left-toolbar {
   display: flex; align-items: center; gap: 12px;
   padding: 6px 10px; background: var(--bg2); border-top: 1px solid var(--border);
@@ -80,6 +94,22 @@ button:active { transform: translateY(1px); }
 #file-list li.active { background: var(--bg3); outline: 1px solid var(--accent); }
 #file-list input[type=checkbox] { accent-color: var(--accent); }
 #file-list .fname { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#file-list li.dir { color: var(--accent2); font-weight: 600; }
+#file-list li.dragging { opacity: 0.4; }
+#file-list li.drop-target { outline: 2px dashed var(--accent2); outline-offset: -2px; background: rgba(90, 209, 201, 0.12); }
+#file-list.drop-root { outline: 2px dashed var(--accent); outline-offset: -2px; }
+.fm-actions { display: flex; gap: 4px; margin-left: auto; margin-right: 8px; }
+.fm-actions button { padding: 2px 8px; font-size: 12px; }
+
+/* ファイル操作の右クリックメニュー */
+#fs-menu {
+  position: fixed; z-index: 100; min-width: 180px;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45); padding: 4px; font-size: 13px;
+}
+.fs-menu-item { padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+.fs-menu-item:hover { background: var(--accent); color: #17131f; }
+
 .search-hit { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
 .search-hit:hover { background: var(--bg3); }
 .search-hit .loc { color: var(--accent2); }
@@ -97,6 +127,41 @@ button:active { transform: translateY(1px); }
 }
 .apply-actions { margin-top: 6px; display: flex; gap: 8px; }
 .apply-btn { background: var(--accent2); color: #10201e; border: none; font-weight: 600; }
+.insert-btn { background: var(--accent); color: #17131f; border: none; font-weight: 600; }
+
+/* 応答待ちインジケータ（prefill/思考中） */
+.wait-indicator {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--muted); font-size: 12px; padding: 2px 0 6px;
+}
+.wait-indicator .dots { display: inline-flex; gap: 3px; }
+.wait-indicator .dots i {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  animation: pixie-pulse 1.2s infinite ease-in-out;
+}
+.wait-indicator .dots i:nth-child(2) { animation-delay: 0.2s; }
+.wait-indicator .dots i:nth-child(3) { animation-delay: 0.4s; }
+@keyframes pixie-pulse {
+  0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+/* 思考（reasoning / <think>）の折りたたみボックス */
+.think-box {
+  margin-bottom: 8px; padding: 6px 10px;
+  border-left: 2px solid var(--accent); border-radius: 4px;
+  background: rgba(139, 124, 255, 0.07);
+}
+.think-box summary {
+  cursor: pointer; font-size: 11px; color: var(--accent);
+  user-select: none; list-style: none;
+}
+.think-box summary::-webkit-details-marker { display: none; }
+.think-box .think-body {
+  margin-top: 6px; font-size: 11px; color: var(--muted);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow-y: auto;
+}
 
 /* エージェントのツール実行ログ（本文とは別枠） */
 .msg .tool-log {

@@ -16,11 +16,26 @@ SYSTEM_PROMPT = """あなたは Markdown エディタに常駐する執筆支援
 
 回答のルール:
 - まず日本語で、何をどう変えたか / 提案の意図を簡潔に説明する。
-- エディタの選択範囲を置き換える「確定テキスト」を提示するときは、必ず次の形式で囲む:
-```apply
-<ここに置換後の Markdown 本文のみ。挨拶・解説・引用符を含めない>
+- 編集の提案は、次の2形式のどちらかで返す（説明文の中に混ぜない）:
+
+【形式1: 部分編集（推奨・複数箇所可）】本文の変更したい箇所ごとにペアで書く:
+```search
+<本文中に実在するテキストを一字一句そのままコピー（省略・要約禁止）>
 ```
-- ```apply ブロックは1メッセージにつき最大1つ。適用不要な相談だけの場合は付けない。
+```replace
+<その箇所の置換後テキスト>
+```
+- search には対象箇所を一意に特定できるだけの行を含める（前後の行を足してよい）。
+- 削除は replace を空にする。複数箇所ならペアを複数並べる。
+
+【形式2: 全置換】選択範囲が短い・全体を書き直す場合のみ:
+```apply
+<置換後の Markdown 本文のみ。挨拶・解説を含めない>
+```
+
+- 重要: unified diff（`+`/`-` 行、```diff）は絶対に出力しない。差分表示はアプリが行う。
+- 「差分を出して」と言われても、説明は日本語の文で述べ、実体は上の2形式で返すこと。
+- 純粋な相談・質問への回答なら、どのブロックも付けない。
 - 参考ファイルが与えられたら内容を踏まえるが、無い情報を創作しない。
 """
 
@@ -50,8 +65,15 @@ def build_messages(user_msg: str, selection: str, context_files: list[dict], his
     return messages
 
 
-async def stream_chat(messages: list[dict]) -> AsyncGenerator[str, None]:
-    """トークンを逐次 yield する非同期ジェネレータ。"""
+def _delta_reasoning(delta: dict) -> str | None:
+    """思考トークンをバックエンド差異を吸収して取り出す。
+    LM Studio: reasoning_content / Ollama(OpenAI互換): reasoning / その他: thinking"""
+    return delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking")
+
+
+async def stream_chat(messages: list[dict]) -> AsyncGenerator[dict, None]:
+    """イベントを逐次 yield する非同期ジェネレータ。
+    {"t": str} 本文トークン / {"r": str} 思考（reasoning）トークン"""
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     payload = {"model": settings.chat_model, "messages": messages, "stream": True, "temperature": 0.4}
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
@@ -61,7 +83,7 @@ async def stream_chat(messages: list[dict]) -> AsyncGenerator[str, None]:
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode("utf-8", "replace")
-                    yield f"\n\n> ⚠️ LLM エラー ({resp.status_code}): {body[:300]}"
+                    yield {"t": f"\n\n> ⚠️ LLM エラー ({resp.status_code}): {body[:300]}"}
                     return
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -70,18 +92,20 @@ async def stream_chat(messages: list[dict]) -> AsyncGenerator[str, None]:
                     if data == "[DONE]":
                         break
                     try:
-                        obj = json.loads(data)
-                        delta = obj["choices"][0]["delta"].get("content")
+                        delta = json.loads(data)["choices"][0]["delta"]
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
-                    if delta:
-                        yield delta
+                    r = _delta_reasoning(delta)
+                    if r:
+                        yield {"r": r}
+                    if delta.get("content"):
+                        yield {"t": delta["content"]}
     except httpx.HTTPError as e:
-        yield (
+        yield {"t": (
             f"\n\n> ⚠️ LLM バックエンドに接続できません（{url}）。\n"
             f"> Ollama / LM Studio が起動しているか、.env の NWP_LLM_BASE_URL を確認してください。\n"
             f"> 詳細: {type(e).__name__}: {e}"
-        )
+        )}
 
 
 async def list_models() -> list[str]:
