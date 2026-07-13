@@ -67,8 +67,9 @@ TOOLS_SPEC: list[dict] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Copilot に添付するワークスペース内ファイルの相対パス（任意・複数可）。"
-                            "長い文書を丸ごと読ませたいときに使う。対応: md/txt/csv/pdf/docx/xlsx/pptx/画像等"
+                            "Copilot に添付するファイルのパス（任意・複数可）。ワークスペース内は相対パス、"
+                            "ユーザーが関連ファイルとして添付したものは提示された絶対パスをそのまま渡す。"
+                            "長い文書やあなたが読めない形式を読ませたいときに使う。対応: md/txt/csv/pdf/docx/xlsx/pptx/画像等"
                         ),
                     },
                 },
@@ -77,6 +78,13 @@ TOOLS_SPEC: list[dict] = [
         },
     },
 ]
+
+
+def active_tools() -> list[dict]:
+    """現在の設定で使えるツール定義を返す。Copilot モードがオフなら ask_copilot を外す。"""
+    if settings.copilot_enabled:
+        return TOOLS_SPEC
+    return [t for t in TOOLS_SPEC if t["function"]["name"] != "ask_copilot"]
 
 
 def _truncate(text: str, limit: int | None = None) -> str:
@@ -103,6 +111,8 @@ async def execute(name: str, args: dict) -> str:
                 return "（マッチなし）"
             return _truncate("\n".join(f"{h['path']}:{h['line']}: {h['text']}" for h in hits))
         if name == "ask_copilot":
+            if not settings.copilot_enabled:
+                return "エラー: Copilot モードがオフです。設定（⚙️）でオンにしてください。"
             return await _ask_copilot(str(args["question"]), args.get("files") or [])
         return f"エラー: 不明なツール '{name}'"
     except FileNotFoundError as e:
@@ -153,8 +163,9 @@ def _last_error_line(stderr: bytes, fallback: str) -> str:
 async def _ask_copilot(question: str, file_rels: list | None = None) -> str:
     """PrayLight の copilot_ask.py を subprocess で呼ぶ。質問は stdin 渡し（引用符問題の回避）。
 
-    file_rels はワークスペース相対パス。safe_path で解決してから --file で渡す
-    （ワークスペース外のファイルは添付させない）。"""
+    file_rels の各要素はワークスペース相対パス、またはユーザーが関連ファイルとして明示添付した
+    絶対パス（.pptx 等、ワークスペース外可）。相対は safe_path、絶対は expanduser().resolve() で
+    解決してから --file で渡す。"""
     script, py = _praylight_paths()
     if not script.exists():
         return f"エラー: PrayLight が見つかりません（{script}）。.env の NWP_PRAYLIGHT_DIR を確認してください。"
@@ -163,7 +174,8 @@ async def _ask_copilot(question: str, file_rels: list | None = None) -> str:
 
     file_args: list[str] = []
     for rel in file_rels or []:
-        p = files.safe_path(str(rel))  # ワークスペース外なら ValueError → execute が拾う
+        # 絶対パスはユーザーが添付した関連ファイルとしてそのまま許可。相対は safe_path でサンドボックス。
+        p = files.resolve_ref(str(rel), external=Path(str(rel)).is_absolute())
         if not p.is_file():
             return f"エラー: 添付ファイルが見つかりません: {rel}。list_workspace で実在するパスを確認してください。"
         file_args += ["--file", str(p)]

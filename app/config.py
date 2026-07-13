@@ -74,6 +74,9 @@ class Settings(BaseSettings):
 
     # --- PrayLight（Copilot 相談ツール）---
     # ask_copilot ツールが subprocess で PrayLight/copilot_ask.py を呼ぶ。
+    # copilot_enabled=False で Copilot 連携（ask_copilot ツール・/copilot 直接質問・
+    # Copilot バー）をまとめて無効化する。GUI の設定（⚙️）から切り替え・永続化できる。
+    copilot_enabled: bool = True
     praylight_dir: str = "../AskCopilot"
     praylight_python: str = ""         # 空なら {praylight_dir}/.venv/Scripts/python.exe
     copilot_timeout: float = 120.0     # Copilot 応答待ちの上限秒数
@@ -90,6 +93,29 @@ def _resolve_root(raw: str) -> Path:
 # `from . import config` して config.WORKSPACE を毎回読むこと。
 WORKSPACE = _resolve_root(settings.workspace_root)
 WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+
+def _read_config_json() -> dict:
+    if CONFIG_JSON.exists():
+        try:
+            return json.loads(CONFIG_JSON.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            return {}  # 壊れた config.json は無視して作り直す
+    return {}
+
+
+def _write_config_json(data: dict) -> None:
+    CONFIG_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def set_config(**kwargs) -> None:
+    """任意の設定キーを config.json に永続化し、稼働中の settings にも反映する。
+    GUI（⚙️ 設定）からの copilot_enabled / chat_model などの切り替えに使う。"""
+    data = _read_config_json()
+    for key, value in kwargs.items():
+        setattr(settings, key, value)
+        data[key] = value
+    _write_config_json(data)
 
 
 def set_workspace(raw: str) -> Path:

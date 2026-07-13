@@ -14,6 +14,9 @@ const state = {
   fsEntries: [],           // /api/files の結果 [{path, type, size?}]
   collapsedDirs: new Set(),// 折りたたみ中のフォルダ
   checkedFiles: new Set(), // コンテキストに含めるファイル（再描画をまたいで保持）
+  refs: [],                // 現在ノートの関連ファイル [{path, external, name}]
+  checkedRefs: new Set(),  // AI コンテキストに含める関連ファイル（refKey で識別）
+  copilotEnabled: true,    // Copilot モード（設定⚙️で切替、/api/settings で確定）
 };
 
 // ---- 起動 -------------------------------------------------------------------
@@ -49,6 +52,7 @@ window.__monacoReady.then((monaco) => {
 
 async function init() {
   await loadModel();
+  await loadSettings();
   await loadFileList();
   bindUI();
 }
@@ -60,6 +64,64 @@ async function loadModel() {
     $("model-name").textContent = r.current || "?";
   } catch { $("model-name").textContent = "未接続"; }
 }
+
+// ---- 設定（⚙️）: Copilot モードのオンオフ・モデル切替 --------------------------
+async function loadSettings() {
+  try {
+    const s = await (await fetch("/api/settings")).json();
+    state.copilotEnabled = !!s.copilot_enabled;
+  } catch { /* 取得失敗時は既定（有効）のまま */ }
+  applyCopilotVisibility();
+}
+
+// Copilot モードに応じて Copilot バーの表示を切り替える
+function applyCopilotVisibility() {
+  $("copilot-bar").classList.toggle("hidden", !state.copilotEnabled);
+}
+
+async function saveSettings(patch) {
+  const r = await (await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  })).json();
+  state.copilotEnabled = !!r.copilot_enabled;
+  applyCopilotVisibility();
+  if (r.chat_model) $("model-name").textContent = r.chat_model;
+}
+
+// 設定ダイアログのモデル選択肢を /api/models から埋める
+async function loadModelOptions() {
+  const sel = $("settings-model");
+  sel.innerHTML = "";
+  let models = [], current = "";
+  try {
+    const r = await (await fetch("/api/models")).json();
+    models = r.models || [];
+    current = r.current || "";
+  } catch { /* バックエンド未接続 */ }
+  if (current && !models.includes(current)) models = [current, ...models];
+  if (!models.length) {
+    const o = document.createElement("option");
+    o.textContent = "（モデル未取得）"; o.disabled = true; o.selected = true;
+    sel.appendChild(o);
+    return;
+  }
+  for (const m of models) {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    if (m === current) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+function openSettingsModal() {
+  $("settings-copilot").checked = state.copilotEnabled;
+  $("settings-modal").classList.remove("hidden");
+  loadModelOptions();
+}
+
+function closeSettingsModal() { $("settings-modal").classList.add("hidden"); }
 
 // ---- ファイル一覧（ツリー表示 + ファイル操作） --------------------------------
 async function loadFileList() {
@@ -146,6 +208,9 @@ async function applyRootChange() {
   state.checkedFiles.clear();
   state.collapsedDirs.clear();
   state.notes = [];
+  state.refs = [];
+  state.checkedRefs.clear();
+  renderRefList();
   state.noteDecorations?.clear();
   state.editor.setValue("# NoteWithPixie へようこそ\n\n右のファイル一覧からファイルを開くか、ここに書き始めましょう。\n");
   setDirty(false);
@@ -386,6 +451,7 @@ async function openFile(path) {
   $("current-file").textContent = path;
   renderFileTree();
   await loadNotes();
+  await loadRefs();
 }
 
 async function saveFile() {
@@ -406,6 +472,212 @@ async function saveFile() {
   setTimeout(() => ($("save-state").textContent = ""), 1500);
   await loadFileList();
 }
+
+// ---- 関連ファイル参照（別ディレクトリの .pptx 等をノートに紐付ける）------------
+// テキストとして AI 文脈に流せる拡張子（バックエンド files.TEXT_EXTS と揃える）
+const REF_TEXT_EXTS = new Set(
+  ["md", "markdown", "txt", "py", "json", "yaml", "yml", "toml", "csv", "html", "css", "js", "ts"]
+);
+const refKey = (r) => (r.external ? "E:" : "I:") + r.path;
+const baseName = (p) => p.split(/[\\/]/).pop();
+function isTextRef(r) {
+  return REF_TEXT_EXTS.has((r.path.split(".").pop() || "").toLowerCase());
+}
+
+async function loadRefs() {
+  if (!state.currentFile) { state.refs = []; renderRefList(); return; }
+  const r = await (await fetch("/api/refs?path=" + encodeURIComponent(state.currentFile))).json();
+  state.refs = r.refs || [];
+  const alive = new Set(state.refs.map(refKey));  // 消えた参照のチェックを掃除
+  for (const k of [...state.checkedRefs]) if (!alive.has(k)) state.checkedRefs.delete(k);
+  renderRefList();
+}
+
+async function saveRefs() {
+  if (!state.currentFile) return;
+  await fetch("/api/refs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: state.currentFile, refs: state.refs }),
+  });
+}
+
+async function addRef(ref) {
+  if (!state.currentFile) { alert("先にノートを開いてください。"); return; }
+  if (state.refs.some((r) => refKey(r) === refKey(ref))) return;  // 重複は無視
+  state.refs.push(ref);
+  await saveRefs();
+  renderRefList();
+}
+
+async function removeRef(i) {
+  const [r] = state.refs.splice(i, 1);
+  if (r) state.checkedRefs.delete(refKey(r));
+  await saveRefs();
+  renderRefList();
+}
+
+async function openRef(r) {
+  const resp = await fetch("/api/refs/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: state.currentFile, path: r.path, external: !!r.external }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert("⚠️ 開けませんでした: " + (err.detail || resp.statusText));
+  }
+}
+
+function renderRefList() {
+  const ul = $("ref-list");
+  const empty = $("ref-empty");
+  ul.innerHTML = "";
+  if (!state.currentFile) {
+    empty.textContent = "ファイルを開くと関連ファイルを紐付けられます。";
+    empty.classList.remove("hidden");
+    return;
+  }
+  if (!state.refs.length) {
+    empty.textContent = "ここにファイルをドラッグ、または「＋参照を追加」で紐付けます。";
+    empty.classList.remove("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  state.refs.forEach((r, i) => {
+    const li = document.createElement("li");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.title = isTextRef(r)
+      ? "AIコンテキストに含める"
+      : "AIコンテキストに含める（.pptx等はエージェント/Copilot経路のみ有効）";
+    cb.checked = state.checkedRefs.has(refKey(r));
+    cb.addEventListener("click", (e) => e.stopPropagation());
+    cb.addEventListener("change", () => {
+      if (cb.checked) state.checkedRefs.add(refKey(r));
+      else state.checkedRefs.delete(refKey(r));
+    });
+    const icon = document.createElement("span");
+    icon.textContent = r.external ? "🔗" : "📄";  // 外部=🔗 / ワークスペース内=📄
+    const name = document.createElement("span");
+    name.className = "fname";
+    name.textContent = r.name || baseName(r.path);
+    name.title = r.path + "（クリックで既定アプリで開く）";
+    name.addEventListener("click", () => openRef(r));
+    const del = document.createElement("button");
+    del.className = "ref-del";
+    del.textContent = "×";
+    del.title = "参照を外す";
+    del.addEventListener("click", (e) => { e.stopPropagation(); removeRef(i); });
+    li.append(cb, icon, name, del);
+    ul.appendChild(li);
+  });
+}
+
+// file:///C:/a/b.pptx → C:/a/b.pptx（OS ドラッグで uri-list が取れた場合のみ）
+function fileUriToPath(uriList) {
+  const line = (uriList || "").split(/\r?\n/).find((l) => l && !l.startsWith("#"));
+  if (!line || !/^file:/i.test(line)) return null;
+  let u = decodeURIComponent(line.replace(/^file:\/\//i, ""));
+  if (/^\/[A-Za-z]:/.test(u)) u = u.slice(1);  // Windows: /C:/… → C:/…
+  return u.replace(/\\/g, "/");
+}
+
+function setupRefDrop() {
+  const zone = $("refmgr");
+  zone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    zone.classList.add("ref-drop");
+  });
+  zone.addEventListener("dragleave", (e) => {
+    if (!zone.contains(e.relatedTarget)) zone.classList.remove("ref-drop");
+  });
+  zone.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    zone.classList.remove("ref-drop");
+    if (!state.currentFile) { alert("先にノートを開いてください。"); return; }
+
+    // 1) アプリ内ファイルツリーからのドラッグ（ワークスペース相対パスが確実に取れる）
+    if (_dragging) {
+      const ent = state.fsEntries.find((f) => f.path === _dragging);
+      if (ent && ent.type === "file") {
+        await addRef({ path: _dragging, external: false, name: baseName(_dragging) });
+      } else {
+        alert("フォルダは参照に追加できません。ファイルをドラッグしてください。");
+      }
+      return;
+    }
+    // 2) OS エクスプローラからのドラッグ（絶対パスが取れる場合のみ）
+    const p = fileUriToPath(e.dataTransfer.getData("text/uri-list") ||
+                            e.dataTransfer.getData("text/plain"));
+    if (p) {
+      await addRef({ path: p, external: true, name: baseName(p) });
+      return;
+    }
+    if (e.dataTransfer.files && e.dataTransfer.files.length) {
+      alert("ブラウザの制限でドラッグしたファイルの絶対パスを取得できません。\n" +
+            "外部ファイルは「＋参照を追加」から選んでください。");
+    }
+  });
+}
+
+// ---- 関連ファイル選択ダイアログ（任意ディレクトリのファイルを参照に追加）--------
+async function browsePick(path) {
+  const resp = await fetch("/api/workspace/dirs?files=true&path=" + encodeURIComponent(path || ""));
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert("⚠️ " + (err.detail || resp.statusText));
+    return;
+  }
+  const r = await resp.json();
+  $("pick-input").value = r.path;
+
+  const drives = $("pick-drives");
+  drives.innerHTML = "";
+  for (const d of r.drives) {
+    const b = document.createElement("button");
+    b.textContent = d;
+    b.classList.toggle("active", r.path.toLowerCase().startsWith(d.toLowerCase().slice(0, 2)));
+    b.addEventListener("click", () => browsePick(d));
+    drives.appendChild(b);
+  }
+
+  const ul = $("pick-list");
+  ul.innerHTML = "";
+  if (r.parent) {
+    const li = document.createElement("li");
+    li.textContent = "⬆ ..（上のフォルダへ）";
+    li.addEventListener("click", () => browsePick(r.parent));
+    ul.appendChild(li);
+  }
+  for (const name of r.dirs) {
+    const li = document.createElement("li");
+    li.textContent = "📁 " + name;
+    li.addEventListener("click", () => browsePick(r.path.replace(/[\\/]$/, "") + "/" + name));
+    ul.appendChild(li);
+  }
+  for (const name of (r.files || [])) {
+    const li = document.createElement("li");
+    li.className = "pick-file";
+    li.textContent = "📄 " + name;
+    li.addEventListener("click", async () => {
+      const abs = (r.path.replace(/[\\/]$/, "") + "/" + name).replace(/\\/g, "/");
+      await addRef({ path: abs, external: true, name });
+      closePickModal();
+    });
+    ul.appendChild(li);
+  }
+}
+
+function openPickModal() {
+  if (!state.currentFile) { alert("先にノートを開いてください。"); return; }
+  $("pick-modal").classList.remove("hidden");
+  browsePick("");  // 現在のワークスペースから開始
+}
+
+function closePickModal() { $("pick-modal").classList.add("hidden"); }
 
 function setDirty(v) {
   state.dirty = v;
@@ -610,6 +882,23 @@ async function sendChat(presetMessage) {
     context_files.push({ path: p, content: r.content });
   }
 
+  // チェック済みの関連ファイル: テキストは内容を文脈へ、バイナリ/外部は絶対パスを Copilot 添付へ
+  const ref_texts = [];
+  const attach_files = [];
+  if (state.currentFile) {
+    for (let i = 0; i < state.refs.length; i++) {
+      const r = state.refs[i];
+      if (!state.checkedRefs.has(refKey(r))) continue;
+      if (isTextRef(r)) {
+        const rr = await (await fetch(
+          `/api/refs/read?note=${encodeURIComponent(state.currentFile)}&idx=${i}`)).json();
+        if (rr && rr.content != null) ref_texts.push({ path: r.path, content: rr.content });
+      } else {
+        attach_files.push(r.path);
+      }
+    }
+  }
+
   addMessage("user", message);
   const assistantEl = addMessage("assistant", "");
   const ui = beginAssistantStream(assistantEl);  // 応答待ちインジケータ + 思考ボックス
@@ -629,6 +918,7 @@ async function sendChat(presetMessage) {
         // 未保存の編集も含めたいのでディスクではなくエディタの内容を送る。
         current_file: state.currentFile || "",
         current_content: state.currentFile ? state.editor.getModel().getValue() : "",
+        ref_texts, attach_files,  // チェック済みの関連ファイル
       }),
     });
     const reader = resp.body.getReader();
@@ -997,6 +1287,24 @@ function bindUI() {
   $("web2md-btn").addEventListener("click", importUrlAsMarkdown);
   document.addEventListener("click", closeFsMenu);
   setupRootDrop();
+  // 関連ファイル参照
+  setupRefDrop();
+  $("ref-add-btn").addEventListener("click", openPickModal);
+  $("pick-cancel").addEventListener("click", closePickModal);
+  $("pick-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); browsePick($("pick-input").value.trim()); }
+  });
+  $("pick-modal").addEventListener("click", (e) => {
+    if (e.target === $("pick-modal")) closePickModal();  // 背景クリックで閉じる
+  });
+  // 設定（⚙️）
+  $("settings-btn").addEventListener("click", openSettingsModal);
+  $("settings-close").addEventListener("click", closeSettingsModal);
+  $("settings-modal").addEventListener("click", (e) => {
+    if (e.target === $("settings-modal")) closeSettingsModal();
+  });
+  $("settings-copilot").addEventListener("change", (e) => saveSettings({ copilot_enabled: e.target.checked }));
+  $("settings-model").addEventListener("change", (e) => { if (e.target.value) saveSettings({ chat_model: e.target.value }); });
   // 保存先ルートの切り替えダイアログ
   $("root-btn").addEventListener("click", openRootModal);
   $("root-cancel").addEventListener("click", closeRootModal);
@@ -1012,6 +1320,8 @@ function bindUI() {
   $("diff-cancel").addEventListener("click", closeDiffPreview);
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("root-modal").classList.contains("hidden")) closeRootModal();
+    else if (e.key === "Escape" && !$("pick-modal").classList.contains("hidden")) closePickModal();
+    else if (e.key === "Escape" && !$("settings-modal").classList.contains("hidden")) closeSettingsModal();
     else if (e.key === "Escape" && !$("diff-overlay").classList.contains("hidden")) closeDiffPreview();
   });
   setupDivider();

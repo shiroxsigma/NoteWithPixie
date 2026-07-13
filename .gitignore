@@ -2,6 +2,9 @@
 .venv/
 .env
 
+# ユーザー/マシン固有のランタイム設定（保存先・Copilotモード・モデル等）
+config.json
+
 # Python
 __pycache__/
 *.pyc

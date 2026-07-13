@@ -20,6 +20,18 @@ def safe_path(rel: str) -> Path:
     return p
 
 
+def resolve_ref(path: str, external: bool) -> Path:
+    """関連ファイル参照を絶対パスへ解決する。
+
+    external=False はワークスペース相対 → safe_path でサンドボックス維持。
+    external=True はワークスペース外の絶対パスを許可する唯一の経路。呼び出し側は
+    「現在ノートの refs サイドカーに登録済みのパス」に限って呼ぶこと（任意パス防止）。
+    """
+    if not external:
+        return safe_path(path)
+    return Path(path).expanduser().resolve()
+
+
 def _hidden(parts: tuple[str, ...]) -> bool:
     """無視ディレクトリ配下、またはドット始まり（.pixie_notes.json 等）を隠す。"""
     return any(part in IGNORE_DIRS or part.startswith(".") for part in parts)

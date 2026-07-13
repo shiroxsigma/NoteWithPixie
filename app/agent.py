@@ -57,14 +57,17 @@ async def run_copilot_direct(
     user_msg: str,
     selection: str,
     context_files: list[dict],
+    attach_files: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    """「/copilot 質問…」用: ローカル LLM を介さず Copilot に直接1回質問する。"""
+    """「/copilot 質問…」用: ローカル LLM を介さず Copilot に直接1回質問する。
+    attach_files（関連ファイルの絶対パス。.pptx 等）はそのまま Copilot へ添付する。"""
     if not user_msg.strip() and not selection.strip():
         yield {"t": "> ⚠️ `/copilot` の後に質問を書いてください（例: `/copilot RAG の最新動向は？`）。テキスト選択だけでも送れます。"}
         return
     question = _build_copilot_question(user_msg or "以下のテキストについて意見をください。", selection, context_files)
-    yield {"s": f"🕊️ /copilot: Copilot に直接質問します（{len(question)} 文字・数十秒かかります）"}
-    answer = await tools.execute("ask_copilot", {"question": question})
+    files_note = f"・添付 {len(attach_files)} 件" if attach_files else ""
+    yield {"s": f"🕊️ /copilot: Copilot に直接質問します（{len(question)} 文字{files_note}・数十秒かかります）"}
+    answer = await tools.execute("ask_copilot", {"question": question, "files": attach_files or []})
     if answer.startswith("エラー"):
         yield {"s": f"⚠️ {answer.splitlines()[0][:160]}"}
         yield {"t": f"> ⚠️ {answer}"}
@@ -80,12 +83,26 @@ async def run_agent(
     history: list[dict],
     current_file: str = "",
     current_content: str = "",
+    attach_files: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
-    """ツール往復つきでチャット1ターンを実行する非同期イベントジェネレータ。"""
+    """ツール往復つきでチャット1ターンを実行する非同期イベントジェネレータ。
+    attach_files はユーザーが明示添付した関連ファイル（.pptx 等、絶対パス）。
+    ローカル LLM は読めないため、内容が要る場合は ask_copilot の files へそのまま渡させる。"""
     # メッセージ組み立ては llm.build_messages を再利用し、システムだけ差し替える
     messages = llm.build_messages(user_msg, selection, context_files, history,
                                   current_file, current_content)
     messages[0] = {"role": "system", "content": AGENT_SYSTEM_PROMPT}
+    if attach_files:
+        listing = "\n".join(f"- {p}" for p in attach_files)
+        messages.insert(-1, {
+            "role": "user",
+            "content": (
+                "（システム: ユーザーが以下のファイルを関連ファイルとして添付しました。"
+                "これらは .pptx など、あなた自身は読めない形式を含みます。"
+                "内容の参照が必要なときは ask_copilot の files に下記の絶対パスをそのまま渡してください）\n"
+                + listing
+            ),
+        })
 
     for _step in range(settings.agent_max_steps):
         tool_calls: list[dict] = []
@@ -172,7 +189,7 @@ async def _stream_step(
         "temperature": 0.4,
     }
     if use_tools:
-        payload["tools"] = tools.TOOLS_SPEC
+        payload["tools"] = tools.active_tools()  # Copilot オフなら ask_copilot を除外
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
 
     acc: dict[int, dict] = {}  # index -> {id, name, arguments}

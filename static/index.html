@@ -15,6 +15,7 @@
       <span id="save-state"></span>
     </div>
     <div class="model-info">model: <span id="model-name">…</span></div>
+    <button id="settings-btn" title="設定">⚙️</button>
   </header>
 
   <main id="split">
@@ -61,6 +62,17 @@
         <div id="search-results" class="hidden"></div>
       </div>
 
+      <div id="refmgr">
+        <div class="section-head">
+          <span>📎 関連ファイル</span>
+          <span class="fm-actions">
+            <button id="ref-add-btn" title="別ディレクトリのファイル（.pptx 等）を参照に追加">＋参照を追加</button>
+          </span>
+        </div>
+        <ul id="ref-list"></ul>
+        <div id="ref-empty" class="hint">ここにファイルをドラッグ、または「＋参照を追加」で紐付けます。</div>
+      </div>
+
       <div id="chat">
         <div id="messages"></div>
         <div id="composer">
@@ -95,6 +107,42 @@
       <div class="root-actions">
         <button id="root-cancel">キャンセル</button>
         <button id="root-ok" class="apply-btn">✓ このフォルダにする</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 関連ファイル選択ダイアログ（任意ディレクトリのファイルを参照に追加） -->
+  <div id="pick-modal" class="hidden">
+    <div id="pick-dialog">
+      <div class="root-head">📎 参照するファイルを選ぶ</div>
+      <div id="pick-drives"></div>
+      <input id="pick-input" type="text" spellcheck="false"
+        placeholder="例: C:\Users\you\decks（Enter でフォルダへ移動）" />
+      <ul id="pick-list"></ul>
+      <div class="root-hint hint">📂 フォルダをクリックで移動 ／ 📄 ファイルをクリックで参照に追加します。</div>
+      <div class="root-actions">
+        <button id="pick-cancel">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 設定ダイアログ（⚙️） -->
+  <div id="settings-modal" class="hidden">
+    <div id="settings-dialog">
+      <div class="root-head">⚙️ 設定</div>
+      <label class="settings-row toggle">
+        <input type="checkbox" id="settings-copilot" />
+        <span>
+          <b>Copilot モード</b>
+          <span class="hint">AIのCopilot相談・<code>/copilot</code> 直接質問・Copilotバーを有効にします。</span>
+        </span>
+      </label>
+      <label class="settings-row">
+        <span><b>モデル</b></span>
+        <select id="settings-model"></select>
+      </label>
+      <div class="root-actions">
+        <button id="settings-close" class="apply-btn">閉じる</button>
       </div>
     </div>
   </div>
