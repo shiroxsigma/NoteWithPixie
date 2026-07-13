@@ -45,12 +45,25 @@ SYSTEM_PROMPT = """あなたは Markdown エディタに常駐する執筆支援
 MAX_CONTEXT_CHARS_PER_FILE = 8000
 
 
-def build_messages(user_msg: str, selection: str, context_files: list[dict], history: list[dict]) -> list[dict]:
+def build_messages(user_msg: str, selection: str, context_files: list[dict], history: list[dict],
+                   current_file: str = "", current_content: str = "") -> list[dict]:
     """フロントから来た素材を chat/completions の messages 配列に組み立てる。"""
     parts: list[str] = []
-    if context_files:
+    if current_file:
+        content = current_content
+        if len(content) > MAX_CONTEXT_CHARS_PER_FILE:
+            content = content[:MAX_CONTEXT_CHARS_PER_FILE] + "\n…（長いため以降を省略）"
+        parts.append(
+            f"# 現在エディタで開いているファイル: {current_file}\n"
+            "（ユーザーが「このファイル」「今のファイル」「開いているファイル」と言う場合はこれを指す。"
+            "内容は未保存の編集を含む最新のもの）\n"
+            f"```\n{content}\n```"
+        )
+    # 開いているファイルは重複させない（上のセクションが未保存編集込みで最新）
+    others = [f for f in context_files if f["path"] != current_file]
+    if others:
         parts.append("# 参考ファイル")
-        for f in context_files:
+        for f in others:
             content = f["content"]
             if len(content) > MAX_CONTEXT_CHARS_PER_FILE:
                 content = content[:MAX_CONTEXT_CHARS_PER_FILE] + "\n…（長いため以降を省略）"

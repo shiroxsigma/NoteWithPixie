@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import string
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import agent, files, llm, patch, search
-from .config import WORKSPACE, settings
+from . import agent, config, files, llm, patch, search, tools
+from .config import settings
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC = BASE / "static"
-NOTES_FILE = WORKSPACE / ".pixie_notes.json"
+
+
+def _notes_file() -> Path:
+    """付箋JSONの置き場所。ワークスペースと一緒に切り替わる。"""
+    return config.WORKSPACE / ".pixie_notes.json"
 
 app = FastAPI(title="NoteWithPixie")
 
@@ -41,6 +49,8 @@ class ChatReq(BaseModel):
     selection: str = ""
     context_files: list[ContextFile] = []
     history: list[dict] = []
+    current_file: str = ""     # エディタで開いているファイル（「このファイル」の指示先）
+    current_content: str = ""  # その内容（未保存の編集を含むエディタバッファ）
 
 
 class SaveReq(BaseModel):
@@ -75,7 +85,7 @@ class PatchReq(BaseModel):
 # --- ファイル API -------------------------------------------------------------
 @app.get("/api/files")
 def api_files():
-    return {"files": files.list_files(), "root": str(WORKSPACE)}
+    return {"files": files.list_files(), "root": str(config.WORKSPACE)}
 
 
 @app.get("/api/file")
@@ -132,9 +142,10 @@ def api_fs_delete(req: FsDeleteReq):
 def _rewrite_notes_on_rename(src: str, dst: str) -> None:
     """改名・移動に合わせて付箋JSONのキー（ファイルパス）を追従させる。
     フォルダ改名なら配下ファイルのキーもプレフィックス書き換え。"""
-    if not NOTES_FILE.exists():
+    notes_file = _notes_file()
+    if not notes_file.exists():
         return
-    data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    data = json.loads(notes_file.read_text(encoding="utf-8"))
     changed = False
     for key in list(data.keys()):
         if key == src:
@@ -144,7 +155,47 @@ def _rewrite_notes_on_rename(src: str, dst: str) -> None:
             data[dst + key[len(src):]] = data.pop(key)
             changed = True
     if changed:
-        NOTES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        notes_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# --- ワークスペース（保存先ルート）の切り替え -----------------------------------
+class WorkspaceReq(BaseModel):
+    root: str
+
+
+@app.post("/api/workspace")
+def api_workspace_set(req: WorkspaceReq):
+    """保存先ルートを切り替えて config.json に永続化する。無いフォルダは作る。"""
+    try:
+        p = config.set_workspace(req.root)
+    except (ValueError, OSError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "root": str(p)}
+
+
+@app.get("/api/workspace/dirs")
+def api_workspace_dirs(path: str = ""):
+    """フォルダ選択ダイアログ用: 指定パス直下のサブフォルダ一覧を返す。
+    path 省略時は現在のワークスペース。ローカル専用アプリなので全ドライブを見せてよい。"""
+    base = Path(path).expanduser() if path.strip() else config.WORKSPACE
+    try:
+        base = base.resolve()
+    except OSError as e:
+        raise HTTPException(400, str(e))
+    if not base.is_dir():
+        raise HTTPException(400, f"フォルダが見つかりません: {base}")
+    try:
+        dirs = sorted(
+            (d.name for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")),
+            key=str.lower,
+        )
+    except PermissionError:
+        dirs = []
+    parent = str(base.parent) if base.parent != base else None
+    drives = []
+    if os.name == "nt":
+        drives = [f"{c}:/" for c in string.ascii_uppercase if Path(f"{c}:/").exists()]
+    return {"path": str(base), "parent": parent, "dirs": dirs, "drives": drives}
 
 
 @app.get("/api/search")
@@ -162,19 +213,21 @@ def api_patch(req: PatchReq):
 # --- 付箋（インラインコメント）の永続化 ---------------------------------------
 @app.get("/api/notes")
 def api_notes_get(path: str):
-    if not NOTES_FILE.exists():
+    notes_file = _notes_file()
+    if not notes_file.exists():
         return {"notes": []}
-    data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    data = json.loads(notes_file.read_text(encoding="utf-8"))
     return {"notes": data.get(path, [])}
 
 
 @app.post("/api/notes")
 def api_notes_set(path: str, notes: list[dict]):
+    notes_file = _notes_file()
     data = {}
-    if NOTES_FILE.exists():
-        data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    if notes_file.exists():
+        data = json.loads(notes_file.read_text(encoding="utf-8"))
     data[path] = notes
-    NOTES_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    notes_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True}
 
 
@@ -188,18 +241,81 @@ async def api_models():
 async def api_chat(req: ChatReq):
     context = [{"path": c.path, "content": c.content} for c in req.context_files]
 
+    # 先頭が "/copilot" なら、agent_mode に関係なく Copilot へ直接聞きに行く
+    msg = req.message.strip()
+    copilot_direct = msg.lower().startswith("/copilot")
+    if copilot_direct:
+        msg = msg[len("/copilot"):].strip()
+
     async def gen():
         # SSE: {"t": 本文} / {"r": 思考} / {"s": ツールステータス} を JSON でくるんで送る
-        if settings.agent_mode:
-            source = agent.run_agent(req.message, req.selection, context, req.history)
+        if copilot_direct:
+            source = agent.run_copilot_direct(msg, req.selection, context)
+        elif settings.agent_mode:
+            source = agent.run_agent(req.message, req.selection, context, req.history,
+                                     req.current_file, req.current_content)
         else:
-            messages = llm.build_messages(req.message, req.selection, context, req.history)
+            messages = llm.build_messages(req.message, req.selection, context, req.history,
+                                          req.current_file, req.current_content)
             source = llm.stream_chat(messages)
         async for ev in source:
             yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# --- URL → Markdown 取り込み ----------------------------------------------------
+class Web2MdReq(BaseModel):
+    url: str
+
+
+def _unique_md_path(title: str, fallback: str) -> str:
+    """タイトルからワークスペース内の未使用ファイル名（web/ 配下）を作る。"""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip().rstrip(".") or fallback
+    cleaned = cleaned[:80]  # 長すぎるタイトルはファイル名として切り詰める
+    base = f"web/{cleaned}"
+    rel = base + ".md"
+    n = 2
+    while files.safe_path(rel).exists():
+        rel = f"{base}-{n}.md"
+        n += 1
+    return rel
+
+
+@app.post("/api/web2md")
+async def api_web2md(req: Web2MdReq):
+    """URL を Markdown 化してワークスペース（web/）に保存し、パスを返す。"""
+    url = req.url.strip()
+    if not re.match(r"^https?://", url):
+        return {"ok": False, "error": "http(s):// で始まる URL を指定してください。", "path": ""}
+    markdown = await tools.url_to_markdown(url)
+    if markdown.startswith("エラー"):
+        return {"ok": False, "error": markdown, "path": ""}
+
+    # 先頭の「# タイトル」行をファイル名に使う
+    first = markdown.splitlines()[0] if markdown.splitlines() else ""
+    title = first.lstrip("# ").strip() if first.startswith("#") else ""
+    rel = _unique_md_path(title or urlparse(url).netloc, urlparse(url).netloc or "page")
+    files.write_file(rel, markdown)
+    return {"ok": True, "error": "", "path": rel}
+
+
+# --- Copilot 連携（PrayLight のブラウザ経由）-----------------------------------
+@app.post("/api/copilot/open")
+async def api_copilot_open():
+    """デバッグ用ブラウザを起動して Copilot を開く（人がそこで対話する）。"""
+    error = await tools.open_copilot_browser()
+    return {"ok": not error, "error": error}
+
+
+@app.post("/api/copilot/read")
+async def api_copilot_read():
+    """開いている Copilot タブの会話ログを Markdown で取得する。"""
+    text = await tools.read_copilot_conversation()
+    if text.startswith("エラー"):
+        return {"ok": False, "error": text, "transcript": ""}
+    return {"ok": True, "error": "", "transcript": text}
 
 
 # --- 静的フロント -------------------------------------------------------------
@@ -214,8 +330,12 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 def run() -> None:
     import uvicorn
 
-    print(f"NoteWithPixie -> http://{settings.host}:{settings.port}  (workspace: {WORKSPACE})")
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    print(f"NoteWithPixie -> http://{settings.host}:{settings.port}  (workspace: {config.WORKSPACE})")
+    if settings.reload:
+        # reload はアプリ実体でなく import 文字列が必要（ウォッチャが再importするため）
+        uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=True)
+    else:
+        uvicorn.run(app, host=settings.host, port=settings.port)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,52 @@ AGENT_SYSTEM_PROMPT = llm.SYSTEM_PROMPT + """
 - 最新情報・外部知識・推敲の別視点が必要なときだけ ask_copilot を使う（遅いので1依頼につき原則1回まで）。
 - 必要な情報が揃ったら、ツールを呼ばずに最終回答を書く。ツール結果の丸写しではなく、依頼に沿って整理する。
 - 推測でパスを書かない。実在確認できたファイルだけを参照する。
+- 「現在エディタで開いているファイル」がメッセージに添付されている場合、その内容は未保存の編集を含む最新版。
+  同じファイルを read_note で読み直さない（ディスク上の古い内容が返る）。
 """
+
+
+# /copilot 直行時に質問へ添える文脈の上限（Web版 Copilot の入力制限を考慮）
+COPILOT_QUESTION_MAX_CHARS = 15_000
+
+
+def _build_copilot_question(
+    user_msg: str,
+    selection: str,
+    context_files: list[dict],
+) -> str:
+    """/copilot 用に自己完結した質問文を組み立てる。
+    Copilot は会話履歴もワークスペースも見えないため、選択テキストと
+    チェック済み添付ファイルを本文に含める（開いているだけのファイルは含めない）。"""
+    parts = [user_msg]
+    if selection.strip():
+        parts.append(f"--- 選択テキスト ---\n{selection}")
+    for c in context_files:
+        parts.append(f"--- 添付ファイル: {c['path']} ---\n{c['content']}")
+    q = "\n\n".join(parts)
+    if len(q) > COPILOT_QUESTION_MAX_CHARS:
+        q = q[:COPILOT_QUESTION_MAX_CHARS] + "\n…（長いため以降は省略）"
+    return q
+
+
+async def run_copilot_direct(
+    user_msg: str,
+    selection: str,
+    context_files: list[dict],
+) -> AsyncGenerator[dict, None]:
+    """「/copilot 質問…」用: ローカル LLM を介さず Copilot に直接1回質問する。"""
+    if not user_msg.strip() and not selection.strip():
+        yield {"t": "> ⚠️ `/copilot` の後に質問を書いてください（例: `/copilot RAG の最新動向は？`）。テキスト選択だけでも送れます。"}
+        return
+    question = _build_copilot_question(user_msg or "以下のテキストについて意見をください。", selection, context_files)
+    yield {"s": f"🕊️ /copilot: Copilot に直接質問します（{len(question)} 文字・数十秒かかります）"}
+    answer = await tools.execute("ask_copilot", {"question": question})
+    if answer.startswith("エラー"):
+        yield {"s": f"⚠️ {answer.splitlines()[0][:160]}"}
+        yield {"t": f"> ⚠️ {answer}"}
+        return
+    yield {"s": "✅ Copilot の回答を受信しました"}
+    yield {"t": answer}
 
 
 async def run_agent(
@@ -33,10 +78,13 @@ async def run_agent(
     selection: str,
     context_files: list[dict],
     history: list[dict],
+    current_file: str = "",
+    current_content: str = "",
 ) -> AsyncGenerator[dict, None]:
     """ツール往復つきでチャット1ターンを実行する非同期イベントジェネレータ。"""
     # メッセージ組み立ては llm.build_messages を再利用し、システムだけ差し替える
-    messages = llm.build_messages(user_msg, selection, context_files, history)
+    messages = llm.build_messages(user_msg, selection, context_files, history,
+                                  current_file, current_content)
     messages[0] = {"role": "system", "content": AGENT_SYSTEM_PROMPT}
 
     for _step in range(settings.agent_max_steps):

@@ -9,6 +9,7 @@ const state = {
   notes: [],               // [{line, text}]
   history: [],             // chat history [{role, content}]
   streaming: false,
+  abortCtrl: null,         // ストリーミング中の fetch を中断するための AbortController
   pendingTarget: null,     // 反映先として追跡中の選択範囲（1つだけ）
   fsEntries: [],           // /api/files の結果 [{path, type, size?}]
   collapsedDirs: new Set(),// 折りたたみ中のフォルダ
@@ -62,12 +63,94 @@ async function loadModel() {
 
 // ---- ファイル一覧（ツリー表示 + ファイル操作） --------------------------------
 async function loadFileList() {
-  const { files } = await (await fetch("/api/files")).json();
+  const { files, root } = await (await fetch("/api/files")).json();
   state.fsEntries = files;
+  renderRootPath(root);
   // 消えたファイルはチェック集合からも掃除する
   const alive = new Set(files.filter((f) => f.type === "file").map((f) => f.path));
   for (const p of [...state.checkedFiles]) if (!alive.has(p)) state.checkedFiles.delete(p);
   renderFileTree();
+}
+
+// ---- 保存先ルートの表示と切り替え --------------------------------------------
+function renderRootPath(root) {
+  if (!root) return;
+  const el = $("root-path");
+  el.title = root;
+  // 長いパスは末尾側（フォルダ名）を優先して見せる
+  el.textContent = root.length > 48 ? "…" + root.slice(-46) : root;
+}
+
+async function browseDirs(path) {
+  const resp = await fetch("/api/workspace/dirs?path=" + encodeURIComponent(path || ""));
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert("⚠️ " + (err.detail || resp.statusText));
+    return;
+  }
+  const r = await resp.json();
+  $("root-input").value = r.path;
+
+  // ドライブボタン（Windows）
+  const drives = $("root-drives");
+  drives.innerHTML = "";
+  for (const d of r.drives) {
+    const b = document.createElement("button");
+    b.textContent = d;
+    b.classList.toggle("active", r.path.toLowerCase().startsWith(d.toLowerCase().slice(0, 2)));
+    b.addEventListener("click", () => browseDirs(d));
+    drives.appendChild(b);
+  }
+
+  // サブフォルダ一覧（先頭に「.. 上へ」）
+  const ul = $("root-dirlist");
+  ul.innerHTML = "";
+  if (r.parent) {
+    const li = document.createElement("li");
+    li.textContent = "⬆ ..（上のフォルダへ）";
+    li.addEventListener("click", () => browseDirs(r.parent));
+    ul.appendChild(li);
+  }
+  for (const name of r.dirs) {
+    const li = document.createElement("li");
+    li.textContent = "📁 " + name;
+    li.addEventListener("click", () => browseDirs(r.path.replace(/[\\/]$/, "") + "/" + name));
+    ul.appendChild(li);
+  }
+}
+
+function openRootModal() {
+  $("root-modal").classList.remove("hidden");
+  browseDirs("");  // 現在のワークスペースから開始
+}
+
+function closeRootModal() { $("root-modal").classList.add("hidden"); }
+
+async function applyRootChange() {
+  const root = $("root-input").value.trim();
+  if (!root) return;
+  if (state.dirty && !confirm("未保存の変更があります。破棄して保存先を切り替えますか？")) return;
+  const resp = await fetch("/api/workspace", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root }),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    alert("⚠️ " + (err.detail || resp.statusText));
+    return;
+  }
+  closeRootModal();
+  // 前のワークスペースに紐づく状態をリセットする
+  state.currentFile = null;
+  state.checkedFiles.clear();
+  state.collapsedDirs.clear();
+  state.notes = [];
+  state.noteDecorations?.clear();
+  state.editor.setValue("# NoteWithPixie へようこそ\n\n右のファイル一覧からファイルを開くか、ここに書き始めましょう。\n");
+  setDirty(false);
+  $("current-file").textContent = "（ファイル未選択）";
+  await loadFileList();
 }
 
 // 祖先フォルダのどれかが折りたたまれていたら非表示
@@ -429,12 +512,94 @@ function collectContext() {
   return [...state.checkedFiles];
 }
 
-async function sendChat() {
+// ---- Copilot 連携（人がブラウザで対話 → 会話を取り込んでまとめる）------------
+function setCopilotStatus(text) { $("copilot-status").textContent = text; }
+
+async function openCopilot() {
+  setCopilotStatus("ブラウザを起動中…");
+  try {
+    const r = await (await fetch("/api/copilot/open", { method: "POST" })).json();
+    setCopilotStatus(r.ok ? "Copilot を開きました。ブラウザで対話してください。" : r.error);
+  } catch (e) {
+    setCopilotStatus("エラー: " + e.message);
+  }
+}
+
+async function importCopilotChat() {
+  if (state.streaming) return;
+  const btn = $("copilot-import-btn");
+  btn.disabled = true;
+  setCopilotStatus("会話を取得中…");
+  let r;
+  try {
+    r = await (await fetch("/api/copilot/read", { method: "POST" })).json();
+  } catch (e) {
+    setCopilotStatus("エラー: " + e.message);
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  if (!r.ok) { setCopilotStatus(r.error); return; }
+  setCopilotStatus("");
+
+  // 入力欄に指示があればそれを優先。無ければ既定の「まとめて」指示。
+  const input = $("chat-input");
+  const instruction = input.value.trim()
+    || "以下は私が Microsoft Copilot と交わした会話ログです。内容を整理して、ノートとして残せる Markdown のまとめを作ってください。";
+  input.value = "";
+  sendChat(instruction + "\n\n---\n\n# Copilot 会話ログ\n\n" + r.transcript);
+}
+
+// URL のページを Markdown 化して web/ に保存し、エディタで開く
+async function importUrlAsMarkdown() {
+  const url = prompt("Markdown にする URL（ログインが必要なページはブラウザで手動ログイン）");
+  if (!url || !url.trim()) return;
+  const btn = $("web2md-btn");
+  btn.disabled = true;
+  btn.textContent = "⏳";
+  try {
+    const r = await (await fetch("/api/web2md", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: url.trim() }),
+    })).json();
+    if (!r.ok) { alert(r.error); return; }
+    await loadFileList();
+    await openFile(r.path);
+  } catch (e) {
+    alert("エラー: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🌐+";
+  }
+}
+
+// 送信ボタンを「送信 ⇔ 停止」で切り替える
+function setSendButtonMode(mode) {
+  const btn = $("send-btn");
+  if (mode === "stop") {
+    btn.textContent = "⏹ 停止";
+    btn.classList.add("stop");
+    btn.title = "応答の生成を中断する";
+  } else {
+    btn.textContent = "送信";
+    btn.classList.remove("stop");
+    btn.title = "";
+  }
+}
+
+// ストリーミング中の応答を中断する（途中までの本文は残る）
+function cancelChat() {
+  if (state.abortCtrl) state.abortCtrl.abort();
+}
+
+async function sendChat(presetMessage) {
   if (state.streaming) return;
   const input = $("chat-input");
-  const message = input.value.trim();
+  const fromInput = typeof presetMessage !== "string";
+  const message = (fromInput ? input.value : presetMessage).trim();
   if (!message) return;
-  input.value = "";
+  if (fromInput) input.value = "";
 
   const selection = getSelection();
   const applyTarget = trackApplyTarget();  // 送信時の選択範囲を追跡（編集してもズレない）
@@ -449,13 +614,22 @@ async function sendChat() {
   const assistantEl = addMessage("assistant", "");
   const ui = beginAssistantStream(assistantEl);  // 応答待ちインジケータ + 思考ボックス
   state.streaming = true;
-  $("send-btn").disabled = true;
+  state.abortCtrl = new AbortController();
+  setSendButtonMode("stop");
+  let cancelled = false;
 
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, selection, context_files, history: state.history }),
+      signal: state.abortCtrl.signal,
+      body: JSON.stringify({
+        message, selection, context_files, history: state.history,
+        // 「このファイル」が指せるよう、開いているファイルを常に添える。
+        // 未保存の編集も含めたいのでディスクではなくエディタの内容を送る。
+        current_file: state.currentFile || "",
+        current_content: state.currentFile ? state.editor.getModel().getValue() : "",
+      }),
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -478,14 +652,21 @@ async function sendChat() {
       }
     }
   } catch (e) {
-    ui.onToken("\n\n> ⚠️ 接続エラー: " + e.message);
+    if (e.name === "AbortError") {
+      cancelled = true;  // ユーザーによる停止。途中までの本文はそのまま残す
+    } else {
+      ui.onToken("\n\n> ⚠️ 接続エラー: " + e.message);
+    }
   }
   const visible = ui.finish();  // 思考部分を除いた本文（履歴・反映の対象）
   state.streaming = false;
-  $("send-btn").disabled = false;
+  state.abortCtrl = null;
+  setSendButtonMode("send");
+  if (cancelled) addToolStatus(assistantEl, "⏹ キャンセルしました" + (visible.trim() ? "（途中までの応答を表示しています）" : ""));
 
   state.history.push({ role: "user", content: message });
-  state.history.push({ role: "assistant", content: visible });
+  // キャンセル直後で本文が空なら、空のアシスタント発言を履歴に残さない
+  if (visible.trim() || !cancelled) state.history.push({ role: "assistant", content: visible });
 
   // トリガー優先順: search/replace ペア（部分編集）→ ```apply（全置換）→ 汎用挿入
   const edits = extractEdits(visible);
@@ -681,14 +862,23 @@ function renderApplyBlock(el, text, target) {
 }
 
 // メッセージ本文から「反映すべき提案テキスト」を取り出す。
-// 優先: ```apply → diff以外の一般フェンス → ```diff を復元 → 本文そのまま。
+// 優先: ```apply → 本文の大半を占める一般フェンス → ```diff を復元 → 本文そのまま。
 function extractProposed(text) {
   const apply = [...text.matchAll(/```apply\s*\n([\s\S]*?)```/g)];
   if (apply.length) return apply[apply.length - 1][1].replace(/\n$/, "");
+  // 「修正版はこちら: ```...```」のように、フェンスが実質メッセージ全体である場合のみ
+  // 中身を提案として採用する。長い文書に埋め込まれた小さなコード片を拾うと
+  // 文書全体が失われるため、占有率が低いフェンスは無視して本文全体を使う。
   const fence = [...text.matchAll(/```(?!diff\b|search\b|replace\b)[a-zA-Z]*\s*\n([\s\S]*?)```/g)];
-  if (fence.length) return fence[fence.length - 1][1].replace(/\n$/, "");
+  if (fence.length) {
+    const last = fence[fence.length - 1][1].replace(/\n$/, "");
+    if (last.length >= text.trim().length * 0.6) return last;
+  }
   const diff = [...text.matchAll(/```diff\s*\n([\s\S]*?)```/g)];
-  if (diff.length) return diffToAfter(diff[diff.length - 1][1]);
+  if (diff.length) {
+    const last = diff[diff.length - 1][1];
+    if (last.length >= text.trim().length * 0.6) return diffToAfter(last);
+  }
   return text.trim();
 }
 
@@ -791,7 +981,9 @@ function escapeHtml(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<":
 function bindUI() {
   $("save-btn").addEventListener("click", saveFile);
   $("note-btn").addEventListener("click", addNote);
-  $("send-btn").addEventListener("click", sendChat);
+  $("send-btn").addEventListener("click", () => (state.streaming ? cancelChat() : sendChat()));
+  $("copilot-open-btn").addEventListener("click", openCopilot);
+  $("copilot-import-btn").addEventListener("click", importCopilotChat);
   $("chat-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendChat(); }
   });
@@ -802,13 +994,25 @@ function bindUI() {
   // ファイル操作
   $("new-file-btn").addEventListener("click", () => createEntry("file"));
   $("new-folder-btn").addEventListener("click", () => createEntry("dir"));
+  $("web2md-btn").addEventListener("click", importUrlAsMarkdown);
   document.addEventListener("click", closeFsMenu);
   setupRootDrop();
+  // 保存先ルートの切り替えダイアログ
+  $("root-btn").addEventListener("click", openRootModal);
+  $("root-cancel").addEventListener("click", closeRootModal);
+  $("root-ok").addEventListener("click", applyRootChange);
+  $("root-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); browseDirs($("root-input").value.trim()); }
+  });
+  $("root-modal").addEventListener("click", (e) => {
+    if (e.target === $("root-modal")) closeRootModal();  // 背景クリックで閉じる
+  });
   // 差分プレビューの確定/キャンセル（Esc でもキャンセル）
   $("diff-apply").addEventListener("click", () => { if (diffApplyFn) diffApplyFn(); });
   $("diff-cancel").addEventListener("click", closeDiffPreview);
   window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("diff-overlay").classList.contains("hidden")) closeDiffPreview();
+    if (e.key === "Escape" && !$("root-modal").classList.contains("hidden")) closeRootModal();
+    else if (e.key === "Escape" && !$("diff-overlay").classList.contains("hidden")) closeDiffPreview();
   });
   setupDivider();
 

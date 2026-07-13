@@ -49,8 +49,13 @@
           <span class="fm-actions">
             <button id="new-file-btn" title="新規ファイル">📄+</button>
             <button id="new-folder-btn" title="新規フォルダ">📁+</button>
+            <button id="web2md-btn" title="URLのページをMarkdown化して web/ に保存する">🌐+</button>
           </span>
           <input id="file-search" type="search" placeholder="🔍 全文検索…" />
+        </div>
+        <div id="root-bar">
+          <button id="root-btn" title="ノートの保存先フォルダを変更（OneDrive など）">📂</button>
+          <span id="root-path" title=""></span>
         </div>
         <ul id="file-list"></ul>
         <div id="search-results" class="hidden"></div>
@@ -63,15 +68,36 @@
             <span id="sel-chip" class="chip hidden">選択テキスト添付</span>
           </div>
           <textarea id="chat-input" rows="3"
-            placeholder="例）左の選択部分を、チェックした資料を参考にもう少し技術的な表現に。"></textarea>
+            placeholder="例）左の選択部分を、チェックした資料を参考にもう少し技術的な表現に。／先頭に /copilot と書くと Copilot に直接質問します。"></textarea>
           <div class="composer-actions">
             <span class="hint">Ctrl+Enter で送信</span>
             <button id="send-btn">送信</button>
+          </div>
+          <div id="copilot-bar">
+            <button id="copilot-open-btn" title="デバッグ用ブラウザで Copilot を開く（そこで人が対話する）">🕊️ Copilot を開く</button>
+            <button id="copilot-import-btn" title="開いている Copilot の会話を取得してAIにまとめさせる（普段のブラウザでOK・Copilotタブを前面にしておく）">⬇ 会話を取り込んでまとめる</button>
+            <span id="copilot-status" class="hint"></span>
           </div>
         </div>
       </div>
     </section>
   </main>
+
+  <!-- 保存先フォルダ選択ダイアログ -->
+  <div id="root-modal" class="hidden">
+    <div id="root-dialog">
+      <div class="root-head">📂 ノートの保存先フォルダ</div>
+      <div id="root-drives"></div>
+      <input id="root-input" type="text" spellcheck="false"
+        placeholder="例: C:\Users\you\OneDrive - Honda\NoteWithPixie（Enter で移動）" />
+      <ul id="root-dirlist"></ul>
+      <div class="root-hint hint">フォルダをクリックで移動 ／ パスを直接入力して Enter でも移動できます。存在しないフォルダは決定時に作成されます。</div>
+      <div class="root-actions">
+        <button id="root-cancel">キャンセル</button>
+        <button id="root-ok" class="apply-btn">✓ このフォルダにする</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Monaco ローダ（ローカルにベンダリングした vs を優先、無ければCDN） -->
   <script>

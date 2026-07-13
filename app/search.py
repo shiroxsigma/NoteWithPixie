@@ -5,7 +5,8 @@ import json
 import shutil
 import subprocess
 
-from .config import WORKSPACE, settings
+from . import config  # WORKSPACE は実行中に切り替わるため動的に参照する
+from .config import settings
 from .files import IGNORE_DIRS, TEXT_EXTS
 
 
@@ -28,7 +29,7 @@ def _search_rg(query: str, max_results: int) -> list[dict]:
         globs += ["-g", f"*{ext}"]
     for d in IGNORE_DIRS:
         globs += ["-g", f"!{d}/**"]
-    cmd = [settings.rg_path, "--json", "-i", "--max-count", "5", *globs, query, str(WORKSPACE)]
+    cmd = [settings.rg_path, "--json", "-i", "--max-count", "5", *globs, query, str(config.WORKSPACE)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError):
@@ -57,16 +58,17 @@ def _search_rg(query: str, max_results: int) -> list[dict]:
 
 def _search_python(query: str, max_results: int) -> list[dict]:
     q = query.lower()
+    root = config.WORKSPACE
     results: list[dict] = []
-    for p in WORKSPACE.rglob("*"):
-        if any(part in IGNORE_DIRS for part in p.relative_to(WORKSPACE).parts):
+    for p in root.rglob("*"):
+        if any(part in IGNORE_DIRS for part in p.relative_to(root).parts):
             continue
         if not (p.is_file() and p.suffix.lower() in TEXT_EXTS):
             continue
         try:
             for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                 if q in line.lower():
-                    results.append({"path": p.relative_to(WORKSPACE).as_posix(), "line": i, "text": line[:200]})
+                    results.append({"path": p.relative_to(root).as_posix(), "line": i, "text": line[:200]})
                     if len(results) >= max_results:
                         return results
         except OSError:
@@ -78,6 +80,6 @@ def _rel(abs_path: str) -> str:
     from pathlib import Path
 
     try:
-        return Path(abs_path).resolve().relative_to(WORKSPACE).as_posix()
+        return Path(abs_path).resolve().relative_to(config.WORKSPACE).as_posix()
     except ValueError:
         return abs_path

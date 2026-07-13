@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import WORKSPACE
+from . import config  # WORKSPACE は実行中に切り替わるため動的に参照する
 
 # コンテキストとして扱える拡張子とマネージャに表示する拡張子
 TEXT_EXTS = {".md", ".markdown", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".csv", ".html", ".css", ".js", ".ts"}
@@ -13,8 +13,9 @@ MAX_BYTES = 1_000_000  # 1MB を超えるファイルは丸ごと読まない
 
 def safe_path(rel: str) -> Path:
     """相対パスを WORKSPACE 内の絶対パスに解決。外に出ようとしたら ValueError。"""
-    p = (WORKSPACE / rel).resolve()
-    if p != WORKSPACE and WORKSPACE not in p.parents:
+    root = config.WORKSPACE
+    p = (root / rel).resolve()
+    if p != root and root not in p.parents:
         raise ValueError(f"path escapes workspace: {rel}")
     return p
 
@@ -26,12 +27,13 @@ def _hidden(parts: tuple[str, ...]) -> bool:
 
 def list_files() -> list[dict]:
     """ワークスペース内のファイルとフォルダをフラットリストで返す（type 付き）。"""
+    root = config.WORKSPACE
     out: list[dict] = []
-    for p in sorted(WORKSPACE.rglob("*")):
-        rel_parts = p.relative_to(WORKSPACE).parts
+    for p in sorted(root.rglob("*")):
+        rel_parts = p.relative_to(root).parts
         if _hidden(rel_parts):
             continue
-        rel = p.relative_to(WORKSPACE).as_posix()
+        rel = p.relative_to(root).as_posix()
         if p.is_dir():
             out.append({"path": rel, "type": "dir"})
         elif p.is_file() and p.suffix.lower() in TEXT_EXTS:

@@ -101,6 +101,43 @@ button:active { transform: translateY(1px); }
 .fm-actions { display: flex; gap: 4px; margin-left: auto; margin-right: 8px; }
 .fm-actions button { padding: 2px 8px; font-size: 12px; }
 
+/* --- 保存先ルートの表示バーと選択ダイアログ --- */
+#root-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 0 12px 6px; font-size: 11px; color: var(--muted);
+}
+#root-bar button { padding: 2px 8px; font-size: 12px; }
+#root-path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+
+#root-modal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+}
+#root-dialog {
+  width: min(640px, 92vw); max-height: 80vh;
+  display: flex; flex-direction: column; gap: 10px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); padding: 16px;
+}
+.root-head { font-weight: 700; font-size: 14px; }
+#root-drives { display: flex; gap: 4px; flex-wrap: wrap; }
+#root-drives button { padding: 2px 10px; font-size: 12px; }
+#root-drives button.active { border-color: var(--accent); color: var(--accent2); }
+#root-input {
+  width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px; font-size: 13px; font-family: ui-monospace, "Cascadia Code", monospace;
+}
+#root-dirlist {
+  flex: 1; min-height: 160px; max-height: 40vh; overflow-y: auto;
+  margin: 0; padding: 4px; list-style: none;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+#root-dirlist li { padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+#root-dirlist li:hover { background: var(--bg3); }
+.root-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 /* ファイル操作の右クリックメニュー */
 #fs-menu {
   position: fixed; z-index: 100; min-width: 180px;
@@ -184,6 +221,12 @@ button:active { transform: translateY(1px); }
 }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
 #send-btn { background: var(--accent); color: #17131f; border: none; font-weight: 600; padding: 6px 18px; }
+#send-btn.stop { background: #e05561; color: #fff; }
+
+/* Copilot 連携バー（コンポーザ下部） */
+#copilot-bar { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+#copilot-bar button { font-size: 12px; padding: 4px 10px; }
+#copilot-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
 /* 反映先として追跡中の範囲 */
 .pixie-pending-target { background: rgba(90, 209, 201, 0.14); }
