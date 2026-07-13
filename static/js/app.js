@@ -117,6 +117,7 @@ async function loadModelOptions() {
 
 function openSettingsModal() {
   $("settings-copilot").checked = state.copilotEnabled;
+  $("settings-copilot-status").textContent = "";
   $("settings-modal").classList.remove("hidden");
   loadModelOptions();
 }
@@ -797,6 +798,18 @@ async function openCopilot() {
   }
 }
 
+// 設定モーダル内の「Copilot を開く」。状態はモーダル内に表示する（バーは隠れているため）。
+async function openCopilotFromSettings() {
+  const s = $("settings-copilot-status");
+  s.textContent = "ブラウザを起動中…";
+  try {
+    const r = await (await fetch("/api/copilot/open", { method: "POST" })).json();
+    s.textContent = r.ok ? "Copilot を開きました。ブラウザでログイン/対話してください。" : r.error;
+  } catch (e) {
+    s.textContent = "エラー: " + e.message;
+  }
+}
+
 async function importCopilotChat() {
   if (state.streaming) return;
   const btn = $("copilot-import-btn");
@@ -1300,6 +1313,7 @@ function bindUI() {
   // 設定（⚙️）
   $("settings-btn").addEventListener("click", openSettingsModal);
   $("settings-close").addEventListener("click", closeSettingsModal);
+  $("settings-copilot-open").addEventListener("click", openCopilotFromSettings);
   $("settings-modal").addEventListener("click", (e) => {
     if (e.target === $("settings-modal")) closeSettingsModal();
   });
