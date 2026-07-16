@@ -10,6 +10,7 @@ AI の修正案をワンクリックでエディタの選択範囲へ差分反�
 - **Copilot 相談（`ask_copilot`）**: [PrayLight](../PrayLight) 経由で Microsoft Copilot（Web版）に単発質問し、回答をチャットに取り込める（要: PrayLight 側でブラウザ起動＋ログイン）。
 - **OpenAI 互換バックエンド**: Ollama / LM Studio / llama.cpp server を `.env` の URL 切替だけで利用。
 - **爆速ファイル参照**: ripgrep によるワークスペース全文検索（rg 未導入時は Python でフォールバック）。
+- **関連ファイル参照**: 別ディレクトリの pptx/docx/xlsx/pdf をノートに紐付け、テキスト抽出して AI 文脈に流せる（Copilot への添付・既定アプリで開くも可）。
 - **確実な差分反映**: AI は <code>```search</code>/<code>```replace</code> ペア（部分編集・複数箇所可）か <code>```apply</code>（全置換）で提案。適用前に Monaco DiffEditor の**差分プレビュー**（現在 vs 提案、右側は編集可）で確認してから反映。挨拶や解説がエディタに混入しない。
 - **インライン付箋**: 行に📌メモを貼れる。ローカル JSON に永続化。
 - **Markdown プレビュー**: 👁 ボタン / `Ctrl+Shift+P` でエディタ横に表示（既定はオフ、スクロール同期）。<code>```mermaid</code> フェンスは図として描画。AI の返信も同じレンダラで整形される。

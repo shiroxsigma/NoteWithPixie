@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import agent, config, files, llm, patch, search, tools
+from . import agent, config, extract, files, llm, patch, search, tools
 from .config import settings
 
 BASE = Path(__file__).resolve().parent.parent
@@ -284,6 +284,15 @@ def api_refs_read(note: str, idx: int):
     p = files.resolve_ref(r["path"], bool(r.get("external")))
     if not p.is_file():
         raise HTTPException(404, f"ファイルが見つかりません: {p}")
+    if p.suffix.lower() in extract.SUPPORTED_EXTS:
+        # Office 系は画像入りで数十MBが普通なので、テキストの 1MB とは別の上限にする
+        # （抽出されるのはテキストだけで、レスポンス側は MAX_EXTRACT_CHARS で守られる）
+        if p.stat().st_size > extract.MAX_OFFICE_BYTES:
+            raise HTTPException(400, "file too large")
+        try:
+            return {"path": r["path"], "content": extract.extract_text(p)}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     if p.stat().st_size > files.MAX_BYTES:
         raise HTTPException(400, "file too large")
     return {"path": r["path"], "content": p.read_text(encoding="utf-8", errors="replace")}
@@ -399,6 +408,8 @@ def api_settings_get():
         "copilot_enabled": settings.copilot_enabled,
         "chat_model": settings.chat_model,
         "agent_mode": settings.agent_mode,
+        # フロントが対応拡張子をハードコードしなくて済むよう、抽出可能な形式を公開する
+        "extract_exts": sorted(extract.SUPPORTED_EXTS),
     }
 
 

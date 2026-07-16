@@ -9,6 +9,10 @@ fastapi = "*"
 httpx = "*"
 pydantic-settings = "*"
 python-dotenv = "*"
+python-pptx = "*"
+python-docx = "*"
+openpyxl = "*"
+pypdf = "*"
 
 [dev-packages]
 

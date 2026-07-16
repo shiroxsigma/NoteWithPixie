@@ -139,7 +139,9 @@ async function loadSettings() {
   try {
     const s = await getJSON("/api/settings");
     state.copilotEnabled = !!s.copilot_enabled;
-  } catch { /* 取得失敗時は既定（有効）のまま */ }
+    // サーバが抽出できる拡張子（バックエンドのライブラリ構成が真実なので毎回同期する）
+    if (Array.isArray(s.extract_exts)) extractExts = new Set(s.extract_exts);
+  } catch { /* 取得失敗時は既定のまま */ }
   applyCopilotVisibility();
 }
 
@@ -620,8 +622,19 @@ const REF_TEXT_EXTS = new Set(
 );
 const refKey = (r) => (r.external ? "E:" : "I:") + r.path;
 const baseName = (p) => p.split(/[\\/]/).pop();
+const refExt = (r) => "." + (r.path.split(".").pop() || "").toLowerCase();
+
+/** サーバがテキスト抽出できる拡張子（pptx/docx 等）。/api/settings から取得して上書きする。
+    ハードコードのフォールバックを持つのは、設定 GET が失敗してもチェックボックスの
+    説明が嘘にならないようにするため。 */
+let extractExts = new Set([".pptx", ".docx", ".xlsx", ".pdf"]);
+
 function isTextRef(r) {
   return REF_TEXT_EXTS.has((r.path.split(".").pop() || "").toLowerCase());
+}
+/** サーバ側で Markdown 抽出して文脈に流せる参照か（Office 文書・PDF）。 */
+function isExtractableRef(r) {
+  return extractExts.has(refExt(r));
 }
 
 async function loadRefs() {
@@ -691,7 +704,9 @@ function renderRefList() {
     cb.type = "checkbox";
     cb.title = isTextRef(r)
       ? "AIコンテキストに含める"
-      : "AIコンテキストに含める（.pptx等はエージェント/Copilot経路のみ有効）";
+      : isExtractableRef(r)
+        ? "AIコンテキストに含める（サーバでテキスト抽出して同梱）"
+        : "AIコンテキストに含める（この形式はエージェント/Copilot経路のみ有効）";
     cb.checked = state.checkedRefs.has(refKey(r));
     cb.addEventListener("click", (e) => e.stopPropagation());
     cb.addEventListener("change", () => {
@@ -1147,16 +1162,19 @@ async function sendChat(presetMessage) {
     context_files.push({ path: p, content: r.content });
   }
 
-  // チェック済みの関連ファイル: テキストは内容を文脈へ、バイナリ/外部は絶対パスを Copilot 添付へ
+  // チェック済みの関連ファイル: テキストと抽出可能な形式（pptx/docx 等）は内容を文脈へ、
+  // それ以外のバイナリは絶対パスを Copilot 添付へ
   const ref_texts = [];
   const attach_files = [];
   if (state.currentFile) {
     for (let i = 0; i < state.refs.length; i++) {
       const r = state.refs[i];
       if (!state.checkedRefs.has(refKey(r))) continue;
-      if (isTextRef(r)) {
-        const rr = await (await fetch(
-          `/api/refs/read?note=${encodeURIComponent(state.currentFile)}&idx=${i}`)).json();
+      if (isTextRef(r) || isExtractableRef(r)) {
+        // 抽出失敗（旧 .ppt 形式など）は tryJSON が理由を alert で見せて undefined を
+        // 返すので、そのファイルだけ抜いて送信は続行する
+        const rr = await tryJSON(
+          `/api/refs/read?note=${encodeURIComponent(state.currentFile)}&idx=${i}`);
         if (rr && rr.content != null) ref_texts.push({ path: r.path, content: rr.content });
       } else {
         attach_files.push(r.path);
@@ -1651,6 +1669,7 @@ function bindUI() {
     saveFile, openFile, refreshDirty, renderSaveState, scheduleAutosave, flushAutosave,
     loadHistory, saveHistory, clearHistory, AUTOSAVE_DELAY_MS,
     addMessage, renderPatchAction, togglePreview, isPreviewOpen, renderPreview,
+    isTextRef, isExtractableRef, loadSettings,
   };
 }
 
