@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 
 from . import files, search
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 # OpenAI 互換 function calling スキーマ
 TOOLS_SPEC: list[dict] = [
@@ -94,6 +97,23 @@ def _truncate(text: str, limit: int | None = None) -> str:
     return text[:limit] + f"\n…（長いため以降 {len(text) - limit} 文字を省略）"
 
 
+def _require(args: dict, key: str) -> str:
+    """LLM が必須引数を省いた場合に、そのまま返せるメッセージで ValueError にする。
+    args[key] を直接引かないのは、KeyError を「引数不足」と「実装バグ」の両方に
+    使ってしまうと後者が前者に化けて隠れるため。"""
+    v = args.get(key)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        raise ValueError(f"必須引数 '{key}' がありません。")
+    return str(v)
+
+
+def _format_entry(f: dict) -> str:
+    """list_files() の1件を1行に。dir には size が無い（files.list_files 参照）。"""
+    if f.get("type") == "dir":
+        return f"{f['path']}/"
+    return f"{f['path']} ({f['size']} bytes)"
+
+
 async def execute(name: str, args: dict) -> str:
     """ツールを実行して結果文字列を返す。失敗も例外でなく文字列で返し、LLM に自己修正させる。"""
     try:
@@ -101,26 +121,29 @@ async def execute(name: str, args: dict) -> str:
             items = files.list_files()
             if not items:
                 return "（ワークスペースは空です）"
-            return _truncate("\n".join(f"{f['path']} ({f['size']} bytes)" for f in items))
+            return _truncate("\n".join(_format_entry(f) for f in items))
         if name == "read_note":
-            return _truncate(files.read_file(str(args["path"])))
+            return _truncate(files.read_file(_require(args, "path")))
         if name == "grep_workspace":
             # search.search は subprocess.run（ブロッキング）なのでスレッドへ逃がす
-            hits = await asyncio.to_thread(search.search, str(args["query"]))
+            hits = await asyncio.to_thread(search.search, _require(args, "query"))
             if not hits:
                 return "（マッチなし）"
             return _truncate("\n".join(f"{h['path']}:{h['line']}: {h['text']}" for h in hits))
         if name == "ask_copilot":
             if not settings.copilot_enabled:
                 return "エラー: Copilot モードがオフです。設定（⚙️）でオンにしてください。"
-            return await _ask_copilot(str(args["question"]), args.get("files") or [])
+            return await _ask_copilot(_require(args, "question"), args.get("files") or [])
         return f"エラー: 不明なツール '{name}'"
     except FileNotFoundError as e:
         return f"エラー: ファイルが見つかりません: {e}。list_workspace で実在するパスを確認してください。"
-    except KeyError as e:
-        return f"エラー: 必須引数 {e} がありません。"
     except ValueError as e:
         return f"エラー: {e}"
+    except Exception as e:  # noqa: BLE001
+        # 想定外はアプリ側のバグ。ここで握らないと agent.py の SSE ストリームごと落ちるが、
+        # LLM の入力ミスに見せかけると原因が追えなくなるので「バグ」と明示して返す。
+        logger.exception("tool %s failed", name)
+        return f"エラー: ツール '{name}' の内部エラー（{type(e).__name__}: {e}）。これはアプリ側のバグです。"
 
 
 # --- PrayLight（Copilot）連携 ---------------------------------------------------
