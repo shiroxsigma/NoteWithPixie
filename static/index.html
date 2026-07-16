@@ -167,9 +167,10 @@
   <script>
     window.__MONACO_VS__ = "/static/vendor/monaco/min/vs";
   </script>
-  <!-- markdown-it（UMD）。scripts/fetch_markdown_it.py で取得する。
-       未取得なら 404 になるが、その場合 Markdown 描画は自動で無効化され編集は続けられる。 -->
+  <!-- markdown-it / mermaid（UMD）。scripts/fetch_markdown_it.py と fetch_mermaid.py で取得する。
+       未取得なら 404 になるが、その場合それぞれの機能が無効化されるだけで編集は続けられる。 -->
   <script src="/static/vendor/markdown-it/markdown-it.min.js"></script>
+  <script src="/static/vendor/mermaid/mermaid.min.js"></script>
   <script src="/static/js/monaco-loader.js"></script>
   <script src="/static/js/app.js" type="module"></script>
 </body>

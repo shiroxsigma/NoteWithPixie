@@ -12,6 +12,9 @@ AI の修正案をワンクリックでエディタの選択範囲へ差分反�
 - **爆速ファイル参照**: ripgrep によるワークスペース全文検索（rg 未導入時は Python でフォールバック）。
 - **確実な差分反映**: AI は <code>```search</code>/<code>```replace</code> ペア（部分編集・複数箇所可）か <code>```apply</code>（全置換）で提案。適用前に Monaco DiffEditor の**差分プレビュー**（現在 vs 提案、右側は編集可）で確認してから反映。挨拶や解説がエディタに混入しない。
 - **インライン付箋**: 行に📌メモを貼れる。ローカル JSON に永続化。
+- **Markdown プレビュー**: 👁 ボタン / `Ctrl+Shift+P` でエディタ横に表示（既定はオフ、スクロール同期）。<code>```mermaid</code> フェンスは図として描画。AI の返信も同じレンダラで整形される。
+- **失わない**: 2秒デバウンスの自動保存（切替・離脱の直前にも保存）、保存失敗の明示、未保存のままタブを閉じる際の警告。`Ctrl+S` はエディタ外でも効く。
+- **会話履歴の永続化**: リロードしても復元。ワークスペースごとに分かれる（保存先を切り替えると履歴も切り替わる）。
 
 ## セットアップ
 ```bat
@@ -21,6 +24,7 @@ open_py312.bat            :: もしくは  python -m pipenv install
 :: 2) （任意・推奨）Monaco をローカルに取り込みオフライン化
 python -m pipenv run python scripts/fetch_monaco.py
 python -m pipenv run python scripts/fetch_markdown_it.py   :: markdown-it も同様にローカル化
+python -m pipenv run python scripts/fetch_mermaid.py       :: Mermaid（図表描画）も同様にローカル化
 
 :: 3) 設定
 copy .env.example .env    :: 使う LLM に合わせて編集
@@ -47,7 +51,7 @@ app/            FastAPI バックエンド
   search.py     ripgrep ラッパ
   config.py     設定（NWP_* / .env）
 static/         フロント（Monaco + Vanilla JS）
-scripts/        fetch_monaco.py / fetch_markdown_it.py（オフライン用ベンダリング）
+scripts/        fetch_monaco.py / fetch_markdown_it.py / fetch_mermaid.py（オフライン用ベンダリング）
 workspace/      編集対象ファイル置き場（この外は触れない）
 ```
 

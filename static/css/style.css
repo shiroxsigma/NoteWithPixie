@@ -286,6 +286,24 @@ button:active { transform: translateY(1px); }
 .md th { background: var(--bg2); font-weight: 600; }
 .md img { max-width: 100%; }
 
+/* ---- Mermaid 図 -------------------------------------------------------------
+   .mermaid-src は描画前・描画失敗時のソース。成功すると .mermaid-box に差し替わる。 */
+.mermaid-box {
+  margin: 8px 0; padding: 8px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px;
+  overflow-x: auto; text-align: center;
+}
+/* 幅は markdown.js の toBox が自然幅で固定する（枠に合わせて縮小させないため）。
+   ここで width/max-width を指定すると、それを打ち消してしまう。 */
+.mermaid-box svg { height: auto; }
+.mermaid-src {
+  margin: 8px 0; padding: 8px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; overflow-x: auto; white-space: pre;
+  font-family: ui-monospace, "Cascadia Code", monospace; font-size: 12px;
+}
+/* 構文エラーの図は消さずソースを残す。書きかけの段階では普通に起きる。 */
+.mermaid-src.mermaid-error { border-color: var(--danger); cursor: help; }
+
 /* 応答待ちインジケータ（prefill/思考中） */
 .wait-indicator {
   display: flex; align-items: center; gap: 8px;
