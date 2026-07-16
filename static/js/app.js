@@ -9,8 +9,10 @@ const state = {
   currentFile: null,
   dirty: false,
   savedVersionId: null,    // 保存時点の model.getAlternativeVersionId()。ダーティ判定の基準
-  saving: false,           // 保存中フラグ（Ctrl+S 連打・自動保存との多重実行を防ぐ）
+  saving: false,           // 保存中フラグ（表示用）
+  savePromise: null,       // 進行中の保存。切替前の flush がこれを待つ
   saveError: null,         // 直近の保存失敗（ApiError）。成功でクリア
+  historyLoaded: false,    // 履歴を読めたか。読めていないのに保存すると履歴を消してしまう
   noteDecorations: null,   // Monaco decorations collection
   notes: [],               // [{line, text}]
   history: [],             // chat history [{role, content}]
@@ -79,25 +81,39 @@ async function init() {
 /** サーバの履歴を state に読み込み、チャット欄に再描画する。 */
 async function loadHistory() {
   state.history = [];
+  state.historyLoaded = false;
   $("messages").innerHTML = "";
   let r;
   try {
     r = await getJSON("/api/chat/history");
-  } catch { return; }  // 履歴が読めなくてもチャット自体は使えるので黙って続行
+  } catch (e) {
+    // 読めなくてもチャット自体は使える。ただし「空の履歴」として保存してしまうと
+    // サーバに残っている本物の履歴を上書きして消すので、保存は止める。
+    addToolStatus(addMessage("assistant", ""), `⚠️ 履歴を読み込めませんでした（${e.message}）。`
+      + "この保存先の履歴は、取り違えを防ぐため今回は保存しません。");
+    return;
+  }
   for (const m of r.messages || []) {
     state.history.push({ role: m.role, content: m.content });
     addMessage(m.role, m.content);
   }
+  state.historyLoaded = true;
 }
 
 /** state.history をサーバへ保存する。トリミングはサーバ側で行う。 */
 async function saveHistory() {
+  if (!state.historyLoaded) return;  // 読めていない履歴を上書きしない（loadHistory 参照）
   try {
-    await postJSON("/api/chat/history", { messages: state.history });
+    const r = await postJSON("/api/chat/history", { messages: state.history });
+    // サーバが 100 件に切り詰めた結果を採り込む。捨てると state.history だけが
+    // 際限なく伸び、毎回の /api/chat に巨大な配列を送り続けることになる。
+    if (Array.isArray(r.messages)) state.history = r.messages;
   } catch { /* 保存できなくても進行中の会話は壊さない */ }
 }
 
 async function clearHistory() {
+  // 生成中に消すと、終了時に state.history へ push された1往復だけが復活する
+  if (state.streaming) { alert("⚠️ 応答の生成中は履歴を消去できません。"); return; }
   if (!confirm("この保存先の会話履歴を消去しますか？")) return;
   try {
     await jsonFetch("/api/chat/history", { method: "DELETE" });
@@ -106,6 +122,7 @@ async function clearHistory() {
     return;
   }
   state.history = [];
+  state.historyLoaded = true;  // 消去できた＝サーバの状態は分かっている
   $("messages").innerHTML = "";
 }
 
@@ -242,6 +259,9 @@ function closeRootModal() { $("root-modal").classList.add("hidden"); }
 async function applyRootChange() {
   const root = $("root-input").value.trim();
   if (!root) return;
+  // 生成中に切り替えると、応答完了時に切替先の履歴へ前のワークスペースの会話が
+  // 書き込まれる（loadHistory 済みの state.history に push されるため）
+  if (state.streaming) { alert("⚠️ 応答の生成中は保存先を切り替えられません。"); return; }
   await flushAutosave();
   if (state.dirty && !confirm("未保存の変更を保存できていません。破棄して保存先を切り替えますか？")) return;
   const resp = await fetch("/api/workspace", {
@@ -510,7 +530,7 @@ async function openFile(path) {
   markClean();
   renderSaveState();
   $("current-file").textContent = path;
-  renderPreview();  // setValue は onDidChangeModelContent を通らない経路があるので明示的に
+  renderPreview();  // setValue でも更新はされるが、150ms 待たずに新ファイルを映す
   renderFileTree();
   await loadNotes();
   await loadRefs();
@@ -523,8 +543,11 @@ async function openFile(path) {
  * 戻り値: 保存できたら true。
  */
 async function saveFile(opts = {}) {
-  if (state.saving) return false;          // 多重実行を防ぐ（Ctrl+S 連打・自動保存との競合）
-  clearTimeout(autosaveTimer);             // 今保存するので、予約済みの自動保存は用済み
+  // 進行中の保存があれば、その完了を待ってから判断する。ここで即 false を返すと
+  // flushAutosave が「保存できなかった」と誤認し、ファイル切替時に保存が成功しつつ
+  // あるのに破棄確認が出てしまう。
+  while (state.savePromise) await state.savePromise;
+
   if (!state.currentFile) {
     if (opts.silent) return false;
     const name = prompt("保存するファイル名（例: note.md）");
@@ -532,33 +555,62 @@ async function saveFile(opts = {}) {
     state.currentFile = name;
     $("current-file").textContent = name;
   }
-  const isNew = !state.fsEntries.some((f) => f.path === state.currentFile);
-  // 保存する内容のバージョンを先に採る。POST 中の編集を「保存済」に含めないため。
-  const versionAtSave = state.editor.getModel().getAlternativeVersionId();
+  if (opts.silent && !state.dirty) return true;  // 待っている間に保存済みになった
 
+  state.savePromise = doSave();
+  try {
+    return await state.savePromise;
+  } finally {
+    state.savePromise = null;
+  }
+}
+
+/** 実際の保存。await をまたぐ値は全てここで固定してから使う。 */
+async function doSave() {
+  // path・内容・付箋は await の前に確定させる。await 後に state を読み直すと、
+  // その間にファイルが切り替わっていた場合、A の内容を B のキーで保存してしまう。
+  const path = state.currentFile;
+  const content = state.editor.getValue();
+  const versionAtSave = state.editor.getModel().getAlternativeVersionId();
+  const isNew = !state.fsEntries.some((f) => f.path === path);
+  syncNotesFromDecorations();
+  const notesAtSave = state.notes.map((n) => ({ ...n }));
+
+  clearTimeout(autosaveTimer);   // 今保存するので、予約済みの自動保存は用済み
   state.saving = true;
   renderSaveState("saving");
   try {
-    await postJSON("/api/file", {
-      path: state.currentFile,
-      content: state.editor.getValue(),
-    });
-    await persistNotes();  // 本文編集で移動した付箋位置も保存に反映する
-    state.saveError = null;
-    state.savedVersionId = versionAtSave;
-    refreshDirty();        // 保存中に編集されていれば、ここで未保存へ戻る
-    renderSaveState("saved");
-    // 新規ファイルのときだけツリーを取り直す。自動保存のたびに叩くのは過剰。
-    if (isNew) await loadFileList();
-    return true;
+    await postJSON("/api/file", { path, content });
   } catch (e) {
-    // 失敗したらダーティのまま残す。ここで clean にすると変更が消えたことに気付けない。
+    // 本文が保存できていない。ダーティのまま残す。ここで clean にすると変更が
+    // 消えたことに気付けない。
     state.saveError = e instanceof ApiError ? e : new ApiError(String(e), 0);
     renderSaveState();
     return false;
   } finally {
     state.saving = false;
   }
+
+  // 本文はディスクに載った。保存中にファイルが切り替わっていたら、今バッファに
+  // 載っている別ファイルの基準（savedVersionId）を書き換えてはいけない。
+  if (state.currentFile === path) {
+    state.savedVersionId = versionAtSave;
+    refreshDirty();              // 保存中に編集されていれば、ここで未保存へ戻る
+  }
+  // 新規ファイルのときだけツリーを取り直す。自動保存のたびに叩くのは過剰。
+  if (isNew) await loadFileList();
+
+  // 付箋は本文とは別のサイドカー。ここで失敗しても本文は保存できているので、
+  // 「保存失敗」と一括りにせず、何が起きたかが分かる文言にする。
+  try {
+    await persistNotes(path, notesAtSave);
+    state.saveError = null;
+    renderSaveState("saved");
+  } catch (e) {
+    state.saveError = new ApiError(`本文は保存しましたが、付箋の保存に失敗しました: ${e.message}`, 0);
+    renderSaveState();
+  }
+  return true;
 }
 
 // ---- 関連ファイル参照（別ディレクトリの .pptx 等をノートに紐付ける）------------
@@ -575,8 +627,8 @@ function isTextRef(r) {
 async function loadRefs() {
   if (!state.currentFile) { state.refs = []; renderRefList(); return; }
   const r = await tryJSON("/api/refs?path=" + encodeURIComponent(state.currentFile));
-  if (!r) return;
-  state.refs = r.refs || [];
+  // 失敗時に前のファイルの参照を残さない理由は loadNotes と同じ
+  state.refs = r ? (r.refs || []) : [];
   const alive = new Set(state.refs.map(refKey));  // 消えた参照のチェックを掃除
   for (const k of [...state.checkedRefs]) if (!alive.has(k)) state.checkedRefs.delete(k);
   renderRefList();
@@ -888,18 +940,26 @@ function updateSelectionChip() {
 async function loadNotes() {
   if (!state.currentFile) { state.notes = []; renderNotes(); return; }
   const r = await tryJSON("/api/notes?path=" + encodeURIComponent(state.currentFile));
-  if (!r) return;
-  state.notes = r.notes || [];
+  // 失敗しても前のファイルの付箋を残さない。残すと次の保存でそれを
+  // 「今開いているファイルの付箋」として書き込んでしまう。
+  state.notes = r ? (r.notes || []) : [];
   renderNotes();
 }
-async function persistNotes() {
-  if (!state.currentFile) return;
-  syncNotesFromDecorations();
-  // 付箋の保存失敗は saveFile 側の状態表示に載せたいので、ここでは投げっぱなしにせず伝播させる。
-  await jsonFetch("/api/notes?path=" + encodeURIComponent(state.currentFile), {
+/**
+ * 付箋を保存する。path / notes を省略すると現在ファイルの現在の付箋を保存する。
+ * doSave からは「await をまたぐ前に採ったスナップショット」を明示的に渡す。
+ * 失敗は呼び出し側の表示に載せたいので、握らず伝播させる。
+ */
+async function persistNotes(path = state.currentFile, notes) {
+  if (!path) return;
+  if (notes === undefined) {
+    syncNotesFromDecorations();
+    notes = state.notes;
+  }
+  await jsonFetch("/api/notes?path=" + encodeURIComponent(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(state.notes),
+    body: JSON.stringify(notes),
   });
 }
 // Monaco は編集に合わせてデコレーションを自動で移動する。その現在位置を

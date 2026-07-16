@@ -41,17 +41,25 @@ CHAT_HISTORY_LIMIT = 100  # 履歴は無制限に伸びるとプロンプトも�
 
 def _load_sidecar(path: Path) -> dict:
     """サイドカーJSONを読む。手で編集されて壊れていてもアプリを落とさないよう、
-    未作成・壊れたJSON・dict でない中身はすべて空 dict として扱う。"""
+    未作成・壊れたJSON・dict でない中身はすべて空 dict として扱う。
+
+    ValueError で捕まえるのは、read_text が不正なUTF-8に対して投げる
+    UnicodeDecodeError も含めるため（JSONDecodeError だけだと素通りして 500 になる）。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def _save_sidecar(path: Path, data: dict) -> None:
-    """サイドカーJSONを書く。人が開いて読めるよう日本語そのまま・インデント付き。"""
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    """サイドカーJSONを書く。人が開いて読めるよう日本語そのまま・インデント付き。
+
+    一時ファイルへ書いてから置き換える。自動保存で書き込み頻度が上がったので、
+    書き込み途中で落ちるとワークスペースの付箋・参照・履歴が丸ごと飛びうる。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)  # 同一ディレクトリ内なのでアトミックに入れ替わる
 
 
 app = FastAPI(title="NoteWithPixie")
