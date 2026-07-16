@@ -1,10 +1,16 @@
 // NoteWithPixie フロントエンド本体
+import { ApiError, getJSON, jsonFetch, postJSON, tryJSON } from "./api.js";
+import { available as mdAvailable, renderInto, renderPlain } from "./markdown.js";
+
 const $ = (id) => document.getElementById(id);
 const state = {
   editor: null,
   monaco: null,
   currentFile: null,
   dirty: false,
+  savedVersionId: null,    // 保存時点の model.getAlternativeVersionId()。ダーティ判定の基準
+  saving: false,           // 保存中フラグ（Ctrl+S 連打・自動保存との多重実行を防ぐ）
+  saveError: null,         // 直近の保存失敗（ApiError）。成功でクリア
   noteDecorations: null,   // Monaco decorations collection
   notes: [],               // [{line, text}]
   history: [],             // chat history [{role, content}]
@@ -34,12 +40,19 @@ window.__monacoReady.then((monaco) => {
     automaticLayout: true,
   });
   state.noteDecorations = state.editor.createDecorationsCollection();
+  markClean();  // 初期バッファを基準にする
 
-  state.editor.onDidChangeModelContent(() => setDirty(true));
+  state.editor.onDidChangeModelContent(() => { refreshDirty(); scheduleAutosave(); schedulePreview(); });
   state.editor.onDidChangeCursorSelection(updateSelectionChip);
+  state.editor.onDidScrollChange(() => syncPreviewScroll());
 
-  // Ctrl+S 保存
-  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
+  // Ctrl+S 保存。エディタ内は Monaco がキーを握るので addCommand が要る。
+  // エディタ外（チャット入力・ツリー）は window の keydown 側が拾う（bindUI 参照）。
+  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveFile());
+  // Ctrl+Shift+P も同様。Monaco の既定（コマンドパレット）を上書きするが、
+  // Markdown ノートでパレットの出番は無く、必要なら F1 で従来どおり開ける。
+  state.editor.addCommand(
+    monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyP, () => togglePreview());
   // グリフ（付箋）クリックで編集
   state.editor.onMouseDown((e) => {
     if (e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
@@ -54,13 +67,52 @@ async function init() {
   await loadModel();
   await loadSettings();
   await loadFileList();
+  await loadHistory();
   bindUI();
+}
+
+// ---- 会話履歴の永続化 ---------------------------------------------------------
+// 履歴はワークスペース直下の .pixie_chat.json（サーバ側サイドカー）に置く。
+// localStorage ではなくサーバに置くのは、付箋・関連ファイルと同じく
+// 「ワークスペースを切り替えたら履歴も切り替わる」を自然に成立させるため。
+
+/** サーバの履歴を state に読み込み、チャット欄に再描画する。 */
+async function loadHistory() {
+  state.history = [];
+  $("messages").innerHTML = "";
+  let r;
+  try {
+    r = await getJSON("/api/chat/history");
+  } catch { return; }  // 履歴が読めなくてもチャット自体は使えるので黙って続行
+  for (const m of r.messages || []) {
+    state.history.push({ role: m.role, content: m.content });
+    addMessage(m.role, m.content);
+  }
+}
+
+/** state.history をサーバへ保存する。トリミングはサーバ側で行う。 */
+async function saveHistory() {
+  try {
+    await postJSON("/api/chat/history", { messages: state.history });
+  } catch { /* 保存できなくても進行中の会話は壊さない */ }
+}
+
+async function clearHistory() {
+  if (!confirm("この保存先の会話履歴を消去しますか？")) return;
+  try {
+    await jsonFetch("/api/chat/history", { method: "DELETE" });
+  } catch (e) {
+    alert("⚠️ 履歴を消去できません: " + e.message);
+    return;
+  }
+  state.history = [];
+  $("messages").innerHTML = "";
 }
 
 // ---- モデル情報 -------------------------------------------------------------
 async function loadModel() {
   try {
-    const r = await (await fetch("/api/models")).json();
+    const r = await getJSON("/api/models");
     $("model-name").textContent = r.current || "?";
   } catch { $("model-name").textContent = "未接続"; }
 }
@@ -68,7 +120,7 @@ async function loadModel() {
 // ---- 設定（⚙️）: Copilot モードのオンオフ・モデル切替 --------------------------
 async function loadSettings() {
   try {
-    const s = await (await fetch("/api/settings")).json();
+    const s = await getJSON("/api/settings");
     state.copilotEnabled = !!s.copilot_enabled;
   } catch { /* 取得失敗時は既定（有効）のまま */ }
   applyCopilotVisibility();
@@ -80,11 +132,7 @@ function applyCopilotVisibility() {
 }
 
 async function saveSettings(patch) {
-  const r = await (await fetch("/api/settings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(patch),
-  })).json();
+  const r = await postJSON("/api/settings", patch);
   state.copilotEnabled = !!r.copilot_enabled;
   applyCopilotVisibility();
   if (r.chat_model) $("model-name").textContent = r.chat_model;
@@ -126,7 +174,9 @@ function closeSettingsModal() { $("settings-modal").classList.add("hidden"); }
 
 // ---- ファイル一覧（ツリー表示 + ファイル操作） --------------------------------
 async function loadFileList() {
-  const { files, root } = await (await fetch("/api/files")).json();
+  const r = await tryJSON("/api/files");
+  if (!r) return;
+  const { files, root } = r;
   state.fsEntries = files;
   renderRootPath(root);
   // 消えたファイルはチェック集合からも掃除する
@@ -192,7 +242,8 @@ function closeRootModal() { $("root-modal").classList.add("hidden"); }
 async function applyRootChange() {
   const root = $("root-input").value.trim();
   if (!root) return;
-  if (state.dirty && !confirm("未保存の変更があります。破棄して保存先を切り替えますか？")) return;
+  await flushAutosave();
+  if (state.dirty && !confirm("未保存の変更を保存できていません。破棄して保存先を切り替えますか？")) return;
   const resp = await fetch("/api/workspace", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -211,12 +262,16 @@ async function applyRootChange() {
   state.notes = [];
   state.refs = [];
   state.checkedRefs.clear();
+  state.pendingTarget = null;  // 前のファイルを指したままの反映先を持ち越さない
   renderRefList();
   state.noteDecorations?.clear();
   state.editor.setValue("# NoteWithPixie へようこそ\n\n右のファイル一覧からファイルを開くか、ここに書き始めましょう。\n");
-  setDirty(false);
+  state.saveError = null;
+  markClean();
+  renderSaveState();
   $("current-file").textContent = "（ファイル未選択）";
   await loadFileList();
+  await loadHistory();  // 履歴もワークスペースに紐づく。切替先のものを読み直す
 }
 
 // 祖先フォルダのどれかが折りたたまれていたら非表示
@@ -444,34 +499,66 @@ async function deleteEntry(entry) {
 }
 
 async function openFile(path) {
-  if (state.dirty && !confirm("未保存の変更があります。破棄して開きますか？")) return;
-  const r = await (await fetch("/api/file?path=" + encodeURIComponent(path))).json();
+  await flushAutosave();
+  // flush しても dirty なら保存に失敗している。そのときだけ破棄の確認を出す。
+  if (state.dirty && !confirm("未保存の変更を保存できていません。破棄して開きますか？")) return;
+  const r = await tryJSON("/api/file?path=" + encodeURIComponent(path));
+  if (!r) return;  // 読めなかったら現在の内容を壊さずに留まる
   state.currentFile = path;
   state.editor.setValue(r.content);
-  setDirty(false);
+  state.saveError = null;
+  markClean();
+  renderSaveState();
   $("current-file").textContent = path;
+  renderPreview();  // setValue は onDidChangeModelContent を通らない経路があるので明示的に
   renderFileTree();
   await loadNotes();
   await loadRefs();
 }
 
-async function saveFile() {
+/**
+ * 現在のバッファを保存する。
+ * opts.silent: ファイル未選択でも名前を尋ねない（自動保存用。打鍵2秒後に prompt が
+ *   飛び出すのを防ぐ）。未選択なら何もせず false を返す。
+ * 戻り値: 保存できたら true。
+ */
+async function saveFile(opts = {}) {
+  if (state.saving) return false;          // 多重実行を防ぐ（Ctrl+S 連打・自動保存との競合）
+  clearTimeout(autosaveTimer);             // 今保存するので、予約済みの自動保存は用済み
   if (!state.currentFile) {
+    if (opts.silent) return false;
     const name = prompt("保存するファイル名（例: note.md）");
-    if (!name) return;
+    if (!name) return false;
     state.currentFile = name;
     $("current-file").textContent = name;
   }
-  await fetch("/api/file", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: state.currentFile, content: state.editor.getValue() }),
-  });
-  await persistNotes();  // 本文編集で移動した付箋位置も保存に反映する
-  setDirty(false);
-  $("save-state").textContent = "保存済";
-  setTimeout(() => ($("save-state").textContent = ""), 1500);
-  await loadFileList();
+  const isNew = !state.fsEntries.some((f) => f.path === state.currentFile);
+  // 保存する内容のバージョンを先に採る。POST 中の編集を「保存済」に含めないため。
+  const versionAtSave = state.editor.getModel().getAlternativeVersionId();
+
+  state.saving = true;
+  renderSaveState("saving");
+  try {
+    await postJSON("/api/file", {
+      path: state.currentFile,
+      content: state.editor.getValue(),
+    });
+    await persistNotes();  // 本文編集で移動した付箋位置も保存に反映する
+    state.saveError = null;
+    state.savedVersionId = versionAtSave;
+    refreshDirty();        // 保存中に編集されていれば、ここで未保存へ戻る
+    renderSaveState("saved");
+    // 新規ファイルのときだけツリーを取り直す。自動保存のたびに叩くのは過剰。
+    if (isNew) await loadFileList();
+    return true;
+  } catch (e) {
+    // 失敗したらダーティのまま残す。ここで clean にすると変更が消えたことに気付けない。
+    state.saveError = e instanceof ApiError ? e : new ApiError(String(e), 0);
+    renderSaveState();
+    return false;
+  } finally {
+    state.saving = false;
+  }
 }
 
 // ---- 関連ファイル参照（別ディレクトリの .pptx 等をノートに紐付ける）------------
@@ -487,7 +574,8 @@ function isTextRef(r) {
 
 async function loadRefs() {
   if (!state.currentFile) { state.refs = []; renderRefList(); return; }
-  const r = await (await fetch("/api/refs?path=" + encodeURIComponent(state.currentFile))).json();
+  const r = await tryJSON("/api/refs?path=" + encodeURIComponent(state.currentFile));
+  if (!r) return;
   state.refs = r.refs || [];
   const alive = new Set(state.refs.map(refKey));  // 消えた参照のチェックを掃除
   for (const k of [...state.checkedRefs]) if (!alive.has(k)) state.checkedRefs.delete(k);
@@ -496,7 +584,7 @@ async function loadRefs() {
 
 async function saveRefs() {
   if (!state.currentFile) return;
-  await fetch("/api/refs", {
+  await tryJSON("/api/refs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path: state.currentFile, refs: state.refs }),
@@ -680,10 +768,109 @@ function openPickModal() {
 
 function closePickModal() { $("pick-modal").classList.add("hidden"); }
 
-function setDirty(v) {
-  state.dirty = v;
-  if (v) $("save-state").textContent = "● 未保存";
-  else if ($("save-state").textContent === "● 未保存") $("save-state").textContent = "";
+// ---- 保存状態 ---------------------------------------------------------------
+// ダーティ判定は Monaco の alternativeVersionId を基準にする。単なる「編集された」
+// フラグだと Undo で内容を戻しても未保存のままになるが、この ID は Undo/Redo で
+// 元の値に戻るので「保存時と同じ内容か」を正しく表せる。
+let saveStateTimer = null;
+
+function markClean() {
+  state.savedVersionId = state.editor.getModel().getAlternativeVersionId();
+  state.dirty = false;
+}
+
+function refreshDirty() {
+  const now = state.editor.getModel().getAlternativeVersionId();
+  state.dirty = now !== state.savedVersionId;
+  renderSaveState();
+}
+
+/** 保存インジケータの唯一の描画点。state から表示を決める。 */
+function renderSaveState(transient) {
+  const el = $("save-state");
+  clearTimeout(saveStateTimer);
+  el.classList.remove("save-error");
+  el.title = "";
+
+  if (transient === "saving") { el.textContent = "保存中…"; return; }
+  if (transient === "saved") {
+    el.textContent = "保存済";
+    saveStateTimer = setTimeout(renderSaveState, 1500);  // 1.5秒で状態表示へ戻す
+    return;
+  }
+  if (state.saveError) {
+    el.textContent = "⚠️ 保存失敗";
+    el.classList.add("save-error");
+    el.title = state.saveError.message;
+    return;
+  }
+  el.textContent = state.dirty ? "● 未保存" : "";
+}
+
+// ---- Markdown プレビュー -----------------------------------------------------
+// 既定は非表示（従来の見た目を変えない）。表示中はエディタと横半分ずつ。
+// 差分プレビュー（#diff-overlay）は #left-pane を覆うので、こちらは何もしなくてよい。
+const PREVIEW_DEBOUNCE_MS = 150;  // 自動保存の2秒とは別物。プレビューは即応が要る
+let previewTimer = null;
+
+function isPreviewOpen() { return !$("preview").classList.contains("hidden"); }
+
+function renderPreview() {
+  if (!isPreviewOpen()) return;
+  renderInto($("preview"), state.editor.getValue());
+  syncPreviewScroll();
+}
+
+function schedulePreview() {
+  if (!isPreviewOpen()) return;
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(renderPreview, PREVIEW_DEBOUNCE_MS);
+}
+
+// エディタのスクロール位置に比率で追従させる。行単位の対応付け（source map）は
+// markdown-it のプラグインが要るうえ重いので、まず比率で足りるかを見る。
+function syncPreviewScroll() {
+  if (!isPreviewOpen()) return;
+  const ed = state.editor;
+  const max = ed.getScrollHeight() - ed.getLayoutInfo().height;
+  const ratio = max > 0 ? ed.getScrollTop() / max : 0;
+  const pv = $("preview");
+  pv.scrollTop = ratio * (pv.scrollHeight - pv.clientHeight);
+}
+
+function togglePreview() {
+  if (!mdAvailable()) {
+    alert("⚠️ Markdown プレビューを使うには、先に次を実行してください:\n"
+          + "python -m pipenv run python scripts/fetch_markdown_it.py");
+    return;
+  }
+  const open = !isPreviewOpen();
+  $("preview").classList.toggle("hidden", !open);
+  $("preview-btn").classList.toggle("active", open);
+  if (open) renderPreview();
+  // automaticLayout: true なので Monaco 側の再計算は自動で追従する
+}
+
+// ---- 自動保存 ---------------------------------------------------------------
+// 打鍵が落ち着いてから保存する。ファイル未選択のときは silent で抜けるので、
+// 「書き始めて2秒後にファイル名の prompt が飛び出す」ことはない。
+const AUTOSAVE_DELAY_MS = 2000;
+let autosaveTimer = null;
+
+function scheduleAutosave() {
+  clearTimeout(autosaveTimer);
+  if (!state.currentFile || !state.dirty) return;
+  autosaveTimer = setTimeout(() => {
+    if (!state.dirty) return;              // 2秒の間に Ctrl+S で保存済みかもしれない
+    if (state.saving) { scheduleAutosave(); return; }  // 保存中なら捨てずに予約し直す
+    saveFile({ silent: true });
+  }, AUTOSAVE_DELAY_MS);
+}
+
+/** 保留中の自動保存を今すぐ実行する。ファイル切替・ルート変更・タブ離脱の直前に呼ぶ。 */
+async function flushAutosave() {
+  clearTimeout(autosaveTimer);
+  if (state.currentFile && state.dirty) await saveFile({ silent: true });
 }
 
 // ---- 選択テキスト -----------------------------------------------------------
@@ -700,14 +887,16 @@ function updateSelectionChip() {
 // ---- 付箋（インラインコメント） ---------------------------------------------
 async function loadNotes() {
   if (!state.currentFile) { state.notes = []; renderNotes(); return; }
-  const r = await (await fetch("/api/notes?path=" + encodeURIComponent(state.currentFile))).json();
+  const r = await tryJSON("/api/notes?path=" + encodeURIComponent(state.currentFile));
+  if (!r) return;
   state.notes = r.notes || [];
   renderNotes();
 }
 async function persistNotes() {
   if (!state.currentFile) return;
   syncNotesFromDecorations();
-  await fetch("/api/notes?path=" + encodeURIComponent(state.currentFile), {
+  // 付箋の保存失敗は saveFile 側の状態表示に載せたいので、ここでは投げっぱなしにせず伝播させる。
+  await jsonFetch("/api/notes?path=" + encodeURIComponent(state.currentFile), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(state.notes),
@@ -744,7 +933,7 @@ function addNote() {
   state.notes = state.notes.filter((n) => n.line !== line);
   state.notes.push({ line, text });
   renderNotes();
-  persistNotes();
+  persistNotes().catch((e) => alert("⚠️ 付箋の保存に失敗しました: " + e.message));
 }
 function editNoteAt(line) {
   syncNotesFromDecorations();  // クリック行と付箋の現在位置を一致させてから照合
@@ -754,7 +943,7 @@ function editNoteAt(line) {
   state.notes = state.notes.filter((n) => n.line !== line);
   if (text.trim()) state.notes.push({ line, text });
   renderNotes();
-  persistNotes();
+  persistNotes().catch((e) => alert("⚠️ 付箋の保存に失敗しました: " + e.message));
 }
 
 // ---- 全文検索 ---------------------------------------------------------------
@@ -763,12 +952,15 @@ async function runSearch(q) {
   const box = $("search-results");
   const list = $("file-list");
   if (!q.trim()) { box.classList.add("hidden"); list.classList.remove("hidden"); return; }
-  const { results } = await (await fetch("/api/search?q=" + encodeURIComponent(q))).json();
+  const r = await tryJSON("/api/search?q=" + encodeURIComponent(q));
+  if (!r) return;
+  const { results } = r;
   box.innerHTML = "";
   for (const hit of results) {
     const div = document.createElement("div");
     div.className = "search-hit";
-    div.innerHTML = `<span class="loc">${hit.path}:${hit.line}</span> ${escapeHtml(hit.text)}`;
+    div.innerHTML =
+      `<span class="loc">${escapeHtml(hit.path)}:${hit.line}</span> ${escapeHtml(hit.text)}`;
     div.addEventListener("click", async () => {
       await openFile(hit.path);
       state.editor.revealLineInCenter(hit.line);
@@ -970,6 +1162,7 @@ async function sendChat(presetMessage) {
   state.history.push({ role: "user", content: message });
   // キャンセル直後で本文が空なら、空のアシスタント発言を履歴に残さない
   if (visible.trim() || !cancelled) state.history.push({ role: "assistant", content: visible });
+  saveHistory();  // 1往復ぶんが確定したところで永続化（ストリーミング中は書かない）
 
   // トリガー優先順: search/replace ペア（部分編集）→ ```apply（全置換）→ 汎用挿入
   const edits = extractEdits(visible);
@@ -1030,7 +1223,9 @@ function beginAssistantStream(el) {
     if (allThink) { ensureThinkBox(); thinkBody.textContent = allThink; }
     if (visible.trim()) {
       if (wait.isConnected) wait.remove();   // 本文が出始めたら待機表示は不要
-      el.querySelector(".body").textContent = visible;
+      // ストリーミング中は生テキストのまま。トークンごとに Markdown を組み直すと
+      // 重いうえ、閉じていないフェンスが崩れて見える。整形は finish() で一度だけ行う。
+      renderPlain(el.querySelector(".body"), visible);
     } else if (allThink && phase === "prefill") {
       phase = "thinking";                     // 思考だけ流れている段階
     }
@@ -1049,7 +1244,11 @@ function beginAssistantStream(el) {
         const sec = ((performance.now() - startedAt) / 1000).toFixed(1);
         thinkSummary.textContent = `💭 思考ログ（${allThink.length}文字・${sec}s）`;
         thinkBox.open = false;               // 完了したら折りたたむ（クリックで展開）
+        // 思考ログは Markdown 化しない。整形せず「モデルが吐いたまま」を見せたい。
       }
+      // 本文が出揃ったのでここで一度だけ Markdown へ。search/replace 提案があれば
+      // このあと renderPatchAction がフェンスを置換して描き直す。
+      if (visible.trim()) renderInto(el.querySelector(".body"), visible);
       return visible;
     },
   };
@@ -1067,8 +1266,11 @@ function extractEdits(text) {
 
 // 部分編集の提案：ボタンを付け、押下でサーバ計算 → 差分プレビュー → 適用。
 function renderPatchAction(el, text, edits) {
-  el.querySelector(".body").textContent =
+  // フェンスを畳んでから Markdown 化する。順序が逆だと search/replace の中身が
+  // コードブロックとして本文に展開されてしまう。
+  const folded =
     text.replace(/```search\s*\n[\s\S]*?```\s*\n\s*```replace\s*\n[\s\S]*?```/g, "📝 修正案（差分で確認）");
+  renderInto(el.querySelector(".body"), folded);
   const actions = document.createElement("div");
   actions.className = "apply-actions";
   const btn = document.createElement("button");
@@ -1108,8 +1310,7 @@ async function reflectViaPatch(edits, msgEl) {
     const model = state.editor.getModel();
     state.editor.executeEdits("pixie-patch",
       [{ range: model.getFullModelRange(), text: finalText, forceMoveMarkers: true }]);
-    setDirty(true);
-    state.editor.focus();
+    state.editor.focus();  // ダーティ化は onDidChangeModelContent → refreshDirty が拾う
   }, `差分プレビュー：${r.applied}/${edits.length} 箇所を適用（右は編集して調整可）`);
 }
 
@@ -1200,8 +1401,7 @@ function reflectViaDiff(proposed, target) {
   openDiffPreview(base, proposed, (finalText) => {
     state.editor.executeEdits("pixie-apply", [{ range, text: finalText, forceMoveMarkers: true }]);
     if (target?.coll) target.coll.clear();
-    setDirty(true);
-    state.editor.focus();
+    state.editor.focus();  // ダーティ化は onDidChangeModelContent → refreshDirty が拾う
   });
 }
 
@@ -1271,7 +1471,9 @@ function addMessage(role, text) {
   el.className = "msg " + role;
   const body = document.createElement("div");
   body.className = "body";
-  body.textContent = text;
+  // 自分の発言は打った通りに見せる。整形するのは AI の返信だけ。
+  if (role === "assistant") renderInto(body, text);
+  else renderPlain(body, text);
   el.appendChild(body);
   $("messages").appendChild(el);
   scrollMessages();
@@ -1282,8 +1484,10 @@ function escapeHtml(s) { return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<":
 
 // ---- UI バインド ------------------------------------------------------------
 function bindUI() {
-  $("save-btn").addEventListener("click", saveFile);
+  $("save-btn").addEventListener("click", () => saveFile());  // MouseEvent を opts に渡さない
   $("note-btn").addEventListener("click", addNote);
+  $("preview-btn").addEventListener("click", togglePreview);
+  $("chat-clear-btn").addEventListener("click", clearHistory);
   $("send-btn").addEventListener("click", () => (state.streaming ? cancelChat() : sendChat()));
   $("copilot-open-btn").addEventListener("click", openCopilot);
   $("copilot-import-btn").addEventListener("click", importCopilotChat);
@@ -1317,8 +1521,24 @@ function bindUI() {
   $("settings-modal").addEventListener("click", (e) => {
     if (e.target === $("settings-modal")) closeSettingsModal();
   });
-  $("settings-copilot").addEventListener("change", (e) => saveSettings({ copilot_enabled: e.target.checked }));
-  $("settings-model").addEventListener("change", (e) => { if (e.target.value) saveSettings({ chat_model: e.target.value }); });
+  // 保存に失敗したら UI を実際の状態へ戻す（設定できたように見せない）
+  $("settings-copilot").addEventListener("change", async (e) => {
+    try {
+      await saveSettings({ copilot_enabled: e.target.checked });
+    } catch (err) {
+      alert("⚠️ 設定を保存できません: " + err.message);
+      e.target.checked = state.copilotEnabled;
+    }
+  });
+  $("settings-model").addEventListener("change", async (e) => {
+    if (!e.target.value) return;
+    try {
+      await saveSettings({ chat_model: e.target.value });
+    } catch (err) {
+      alert("⚠️ 設定を保存できません: " + err.message);
+      await loadModelOptions();
+    }
+  });
   // 保存先ルートの切り替えダイアログ
   $("root-btn").addEventListener("click", openRootModal);
   $("root-cancel").addEventListener("click", closeRootModal);
@@ -1333,15 +1553,45 @@ function bindUI() {
   $("diff-apply").addEventListener("click", () => { if (diffApplyFn) diffApplyFn(); });
   $("diff-cancel").addEventListener("click", closeDiffPreview);
   window.addEventListener("keydown", (e) => {
+    // Ctrl/Cmd+S はエディタ外（チャット入力・ツリー・モーダル）でも保存にする。
+    // エディタ内は Monaco の addCommand が先に拾うのでここには来ない。
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "s") {
+      e.preventDefault();  // ブラウザの「ページを保存」を止める
+      saveFile();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "p") {
+      e.preventDefault();
+      togglePreview();
+      return;
+    }
     if (e.key === "Escape" && !$("root-modal").classList.contains("hidden")) closeRootModal();
     else if (e.key === "Escape" && !$("pick-modal").classList.contains("hidden")) closePickModal();
     else if (e.key === "Escape" && !$("settings-modal").classList.contains("hidden")) closeSettingsModal();
     else if (e.key === "Escape" && !$("diff-overlay").classList.contains("hidden")) closeDiffPreview();
   });
+
+  // 別アプリへ切り替えた時点で保存しておく（デバウンス待ちのまま放置させない）
+  window.addEventListener("blur", () => { flushAutosave(); });
+
+  // 未保存のままタブを閉じる経路を塞ぐ。自動保存が効いていれば通常ここは発火しないが、
+  // 保存に失敗したまま閉じようとした場合の最後の砦として残す。
+  window.addEventListener("beforeunload", (e) => {
+    if (!state.dirty) return;
+    e.preventDefault();
+    e.returnValue = "";  // 一部ブラウザは returnValue を見る
+  });
+
   setupDivider();
 
   // E2E テスト用の内部フック（module スコープのため明示的に公開）
-  window.__pixie = { state, extractEdits, extractProposed, reflectViaPatch, reflectViaDiff, openDiffPreview, splitThink, moveIntoDir, moveEntry };
+  window.__pixie = {
+    state, extractEdits, extractProposed, reflectViaPatch, reflectViaDiff, openDiffPreview,
+    splitThink, moveIntoDir, moveEntry,
+    saveFile, openFile, refreshDirty, renderSaveState, scheduleAutosave, flushAutosave,
+    loadHistory, saveHistory, clearHistory, AUTOSAVE_DELAY_MS,
+    addMessage, renderPatchAction, togglePreview, isPreviewOpen, renderPreview,
+  };
 }
 
 function setupDivider() {
