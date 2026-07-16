@@ -6,6 +6,7 @@ import os
 import re
 import string
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +29,30 @@ def _notes_file() -> Path:
 def _refs_file() -> Path:
     """関連ファイル参照JSONの置き場所。ワークスペースと一緒に切り替わる。"""
     return config.WORKSPACE / ".pixie_refs.json"
+
+
+def _chat_file() -> Path:
+    """会話履歴JSONの置き場所。ワークスペースと一緒に切り替わる。"""
+    return config.WORKSPACE / ".pixie_chat.json"
+
+
+CHAT_HISTORY_LIMIT = 100  # 履歴は無制限に伸びるとプロンプトも保存も膨らむので上限を切る
+
+
+def _load_sidecar(path: Path) -> dict:
+    """サイドカーJSONを読む。手で編集されて壊れていてもアプリを落とさないよう、
+    未作成・壊れたJSON・dict でない中身はすべて空 dict として扱う。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_sidecar(path: Path, data: dict) -> None:
+    """サイドカーJSONを書く。人が開いて読めるよう日本語そのまま・インデント付き。"""
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 app = FastAPI(title="NoteWithPixie")
 
@@ -58,6 +83,15 @@ class ChatReq(BaseModel):
     current_content: str = ""  # その内容（未保存の編集を含むエディタバッファ）
     ref_texts: list[ContextFile] = []  # 関連ファイル（テキスト）: context_files と同じ扱い
     attach_files: list[str] = []       # 関連ファイル（バイナリ/外部）の絶対パス: Copilot 添付用
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]  # それ以外の role は保存させない
+    content: str
+
+
+class ChatHistoryReq(BaseModel):
+    messages: list[ChatMessage] = []
 
 
 class FileRef(BaseModel):
@@ -148,8 +182,9 @@ def api_fs_rename(req: FsRenameReq):
         raise HTTPException(404, "not found")
     except (ValueError, OSError) as e:
         raise HTTPException(400, str(e))
-    _rewrite_notes_on_rename(req.src, req.dst)
-    _rewrite_refs_on_rename(req.src, req.dst)
+    # 会話履歴はワークスペース単位で1本（キーがノートパスではない）ので追従不要
+    _rewrite_json_keys(_notes_file(), req.src, req.dst)
+    _rewrite_json_keys(_refs_file(), req.src, req.dst)
     return {"ok": True}
 
 
@@ -164,33 +199,12 @@ def api_fs_delete(req: FsDeleteReq):
         raise HTTPException(400, str(e))
 
 
-def _rewrite_notes_on_rename(src: str, dst: str) -> None:
-    """改名・移動に合わせて付箋JSONのキー（ファイルパス）を追従させる。
-    フォルダ改名なら配下ファイルのキーもプレフィックス書き換え。"""
-    notes_file = _notes_file()
-    if not notes_file.exists():
-        return
-    data = json.loads(notes_file.read_text(encoding="utf-8"))
-    changed = False
-    for key in list(data.keys()):
-        if key == src:
-            data[dst] = data.pop(key)
-            changed = True
-        elif key.startswith(src + "/"):
-            data[dst + key[len(src):]] = data.pop(key)
-            changed = True
-    if changed:
-        notes_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _rewrite_refs_on_rename(src: str, dst: str) -> None:
-    """ノートの改名・移動に合わせて関連ファイルJSONのキー（ノートパス）を追従させる。
-    フォルダ改名なら配下ノートのキーもプレフィックス書き換え（付箋と同じ扱い）。
+def _rewrite_json_keys(file: Path, src: str, dst: str) -> None:
+    """ファイルパスをキーに持つサイドカーJSONを、改名・移動に追従させる。
+    フォルダ改名なら配下のキーもプレフィックス書き換え。
+    付箋（キー=ファイルパス）と関連ファイル参照（キー=ノートパス）で共通の処理。
     参照先ファイル自体のパスは書き換えない（スコープ外）。"""
-    refs_file = _refs_file()
-    if not refs_file.exists():
-        return
-    data = json.loads(refs_file.read_text(encoding="utf-8"))
+    data = _load_sidecar(file)
     changed = False
     for key in list(data.keys()):
         if key == src:
@@ -200,16 +214,12 @@ def _rewrite_refs_on_rename(src: str, dst: str) -> None:
             data[dst + key[len(src):]] = data.pop(key)
             changed = True
     if changed:
-        refs_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_sidecar(file, data)
 
 
 # --- 関連ファイル参照（別ディレクトリの .pptx 等をノートに紐付ける）-------------
 def _load_refs(note: str) -> list[dict]:
-    refs_file = _refs_file()
-    if not refs_file.exists():
-        return []
-    data = json.loads(refs_file.read_text(encoding="utf-8"))
-    return data.get(note, [])
+    return _load_sidecar(_refs_file()).get(note, [])
 
 
 @app.get("/api/refs")
@@ -220,15 +230,13 @@ def api_refs_get(path: str):
 @app.post("/api/refs")
 def api_refs_set(req: RefsSaveReq):
     refs_file = _refs_file()
-    data = {}
-    if refs_file.exists():
-        data = json.loads(refs_file.read_text(encoding="utf-8"))
+    data = _load_sidecar(refs_file)
     payload = [r.model_dump() for r in req.refs]
     if payload:
         data[req.path] = payload
     else:
         data.pop(req.path, None)  # 空になったらキーごと消す
-    refs_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _save_sidecar(refs_file, data)
     return {"ok": True}
 
 
@@ -336,21 +344,38 @@ def api_patch(req: PatchReq):
 # --- 付箋（インラインコメント）の永続化 ---------------------------------------
 @app.get("/api/notes")
 def api_notes_get(path: str):
-    notes_file = _notes_file()
-    if not notes_file.exists():
-        return {"notes": []}
-    data = json.loads(notes_file.read_text(encoding="utf-8"))
-    return {"notes": data.get(path, [])}
+    return {"notes": _load_sidecar(_notes_file()).get(path, [])}
 
 
 @app.post("/api/notes")
 def api_notes_set(path: str, notes: list[dict]):
     notes_file = _notes_file()
-    data = {}
-    if notes_file.exists():
-        data = json.loads(notes_file.read_text(encoding="utf-8"))
+    data = _load_sidecar(notes_file)
     data[path] = notes
-    notes_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _save_sidecar(notes_file, data)
+    return {"ok": True}
+
+
+# --- 会話履歴（ワークスペース単位で1本。ノート単位ではない）---------------------
+@app.get("/api/chat/history")
+def api_chat_history_get():
+    data = _load_sidecar(_chat_file())
+    messages = data.get("messages", [])
+    # 壊れた/手編集されたサイドカーでも配列を約束する（フロントが必ず map できるように）
+    return {"messages": messages if isinstance(messages, list) else []}
+
+
+@app.post("/api/chat/history")
+def api_chat_history_set(req: ChatHistoryReq):
+    payload = [m.model_dump() for m in req.messages[-CHAT_HISTORY_LIMIT:]]
+    _save_sidecar(_chat_file(), {"messages": payload})
+    return {"ok": True, "messages": payload}
+
+
+@app.delete("/api/chat/history")
+def api_chat_history_clear():
+    # ファイルごと消すとワークスペースにゴミが残らない
+    _chat_file().unlink(missing_ok=True)
     return {"ok": True}
 
 
