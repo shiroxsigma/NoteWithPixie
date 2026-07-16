@@ -20,6 +20,7 @@ open_py312.bat            :: もしくは  python -m pipenv install
 
 :: 2) （任意・推奨）Monaco をローカルに取り込みオフライン化
 python -m pipenv run python scripts/fetch_monaco.py
+python -m pipenv run python scripts/fetch_markdown_it.py   :: markdown-it も同様にローカル化
 
 :: 3) 設定
 copy .env.example .env    :: 使う LLM に合わせて編集
@@ -46,7 +47,7 @@ app/            FastAPI バックエンド
   search.py     ripgrep ラッパ
   config.py     設定（NWP_* / .env）
 static/         フロント（Monaco + Vanilla JS）
-scripts/        fetch_monaco.py（オフライン用ベンダリング）
+scripts/        fetch_monaco.py / fetch_markdown_it.py（オフライン用ベンダリング）
 workspace/      編集対象ファイル置き場（この外は触れない）
 ```
 
