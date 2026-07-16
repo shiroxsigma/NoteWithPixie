@@ -138,6 +138,10 @@ class FsDeleteReq(BaseModel):
     path: str
 
 
+class FsOpenReq(BaseModel):
+    path: str  # ワークスペース相対パス
+
+
 class PatchEdit(BaseModel):
     search: str
     replace: str
@@ -156,8 +160,26 @@ def api_files():
 
 @app.get("/api/file")
 def api_read(path: str):
+    """ファイル内容を返す。Office 系（pptx/docx/xlsx/pdf）は Markdown へ抽出して返す。
+
+    抽出は読み取り専用の変換で、保存（POST /api/file）側は対応しない — 抽出結果を
+    編集しても元の pptx へは書き戻せないため。フロントは extracted: true を見て
+    読み取り専用として扱うこと。"""
     try:
-        return {"path": path, "content": files.read_file(path)}
+        p = files.safe_path(path)
+        ext = p.suffix.lower()
+        if ext in extract.SUPPORTED_EXTS:
+            if not p.is_file():
+                raise HTTPException(404, "not found")
+            # refs/read と同じ 50MB 枠（画像入り Office ファイルは数十MBが普通）
+            if p.stat().st_size > extract.MAX_OFFICE_BYTES:
+                raise HTTPException(400, "file too large")
+            return {"path": path, "content": extract.extract_text(p), "extracted": True}
+        if ext not in files.TEXT_EXTS:
+            raise HTTPException(
+                400, f"この形式（{ext or '拡張子なし'}）はテキストとして読めません。"
+            )
+        return {"path": path, "content": files.read_file(path), "extracted": False}
     except FileNotFoundError:
         raise HTTPException(404, "not found")
     except ValueError as e:
@@ -205,6 +227,27 @@ def api_fs_delete(req: FsDeleteReq):
         raise HTTPException(404, "not found")
     except (ValueError, OSError) as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/fs/open")
+def api_fs_open(req: FsOpenReq):
+    """ワークスペース内のファイルを OS の既定アプリで開く（.png や .pptx を実物で見る用）。
+
+    /api/refs/open と違い登録チェックは不要 — ワークスペースは信頼境界の内側なので
+    safe_path のサンドボックス（ルート外拒否）だけで足りる。"""
+    try:
+        p = files.safe_path(req.path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not p.exists():
+        raise HTTPException(404, f"ファイルが見つかりません: {req.path}")
+    if os.name == "nt":
+        os.startfile(str(p))  # noqa: S606 — ローカル専用アプリ、ユーザー起点、ワークスペース内限定
+    else:
+        # 他OS対応が必要なら xdg-open / open へフォールバックする
+        import subprocess
+        subprocess.Popen(["xdg-open", str(p)])
+    return {"ok": True}
 
 
 def _rewrite_json_keys(file: Path, src: str, dst: str) -> None:

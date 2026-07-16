@@ -10,7 +10,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from . import files, search
+from . import extract, files, search
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ TOOLS_SPEC: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_workspace",
-            "description": "ワークスペース内のテキストファイル一覧（相対パスとサイズ）を取得する。どんなファイルがあるか分からないときに最初に使う。",
+            "description": "ワークスペース内のファイル一覧（相対パスとサイズ）を取得する。どんなファイルがあるか分からないときに最初に使う。",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -29,7 +29,7 @@ TOOLS_SPEC: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_note",
-            "description": "ワークスペース内のファイルの中身を読む。path には list_workspace や grep_workspace が返す相対パスを渡す。",
+            "description": "ワークスペース内のファイルの中身を読む。pptx/docx/xlsx/pdf はテキスト抽出して返す。path には list_workspace や grep_workspace が返す相対パスを渡す。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -107,6 +107,27 @@ def _require(args: dict, key: str) -> str:
     return str(v)
 
 
+def _read_note(rel: str) -> str:
+    """ワークスペース内ファイルの本文を返す。Office 系（pptx/docx/xlsx/pdf）は
+    Markdown へテキスト抽出する（API 層の GET /api/file と同じ扱い）。
+    抽出不可・サイズ超過は ValueError → execute() が「エラー: …」文字列に変換する。"""
+    p = files.safe_path(rel)
+    if p.suffix.lower() in extract.SUPPORTED_EXTS:
+        if not p.is_file():
+            raise FileNotFoundError(rel)
+        # refs/read・GET /api/file と同じ 50MB 枠（テキストの 1MB とは別）
+        if p.stat().st_size > extract.MAX_OFFICE_BYTES:
+            raise ValueError("ファイルが大きすぎます（50MB 超）")
+        return extract.extract_text(p)
+    if p.suffix.lower() not in files.TEXT_EXTS:
+        # .png 等を errors="replace" で読むと置換文字の羅列になり LLM の文脈を汚すだけ。
+        # GET /api/file と同じ扱いで弾き、自己修正可能なエラー文にする。
+        raise ValueError(
+            f"この形式（{p.suffix or '拡張子なし'}）はテキストとして読めません。"
+        )
+    return files.read_file(rel)
+
+
 def _format_entry(f: dict) -> str:
     """list_files() の1件を1行に。dir には size が無い（files.list_files 参照）。"""
     if f.get("type") == "dir":
@@ -123,7 +144,7 @@ async def execute(name: str, args: dict) -> str:
                 return "（ワークスペースは空です）"
             return _truncate("\n".join(_format_entry(f) for f in items))
         if name == "read_note":
-            return _truncate(files.read_file(_require(args, "path")))
+            return _truncate(_read_note(_require(args, "path")))
         if name == "grep_workspace":
             # search.search は subprocess.run（ブロッキング）なのでスレッドへ逃がす
             hits = await asyncio.to_thread(search.search, _require(args, "query"))

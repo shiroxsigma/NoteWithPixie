@@ -5,7 +5,7 @@ from pathlib import Path
 
 from . import config  # WORKSPACE は実行中に切り替わるため動的に参照する
 
-# コンテキストとして扱える拡張子とマネージャに表示する拡張子
+# テキストとして扱える拡張子（grep 検索対象など）。一覧の表示フィルタには使わない
 TEXT_EXTS = {".md", ".markdown", ".txt", ".py", ".json", ".yaml", ".yml", ".toml", ".csv", ".html", ".css", ".js", ".ts"}
 IGNORE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".idea", ".vscode"}
 MAX_BYTES = 1_000_000  # 1MB を超えるファイルは丸ごと読まない
@@ -38,7 +38,10 @@ def _hidden(parts: tuple[str, ...]) -> bool:
 
 
 def list_files() -> list[dict]:
-    """ワークスペース内のファイルとフォルダをフラットリストで返す（type 付き）。"""
+    """ワークスペース内のファイルとフォルダをフラットリストで返す（type 付き）。
+
+    拡張子でフィルタしない: .pptx や .png も一覧に出す（Office 系は extract.py で
+    テキスト抽出して読める）。隠しファイル・無視ディレクトリだけ除外する。"""
     root = config.WORKSPACE
     out: list[dict] = []
     for p in sorted(root.rglob("*")):
@@ -48,7 +51,7 @@ def list_files() -> list[dict]:
         rel = p.relative_to(root).as_posix()
         if p.is_dir():
             out.append({"path": rel, "type": "dir"})
-        elif p.is_file() and p.suffix.lower() in TEXT_EXTS:
+        elif p.is_file():
             out.append({"path": rel, "type": "file", "size": p.stat().st_size})
     return out
 

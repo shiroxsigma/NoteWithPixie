@@ -129,6 +129,8 @@ button:active { transform: translateY(1px); }
 #file-list li:hover { background: var(--bg3); }
 #file-list li.active { background: var(--bg3); outline: 1px solid var(--accent); }
 #file-list input[type=checkbox] { accent-color: var(--accent); }
+/* チェックボックスを出さないファイル（画像等）の位置合わせ用ダミー */
+#file-list .cb-pad { width: 13px; flex: none; }
 #file-list .fname { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #file-list li.dir { color: var(--accent2); font-weight: 600; }
 #file-list li.dragging { opacity: 0.4; }

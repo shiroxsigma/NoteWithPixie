@@ -334,22 +334,41 @@ function renderFileTree() {
         renderFileTree();
       });
     } else {
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.title = "チャットのコンテキストに含める";
-      cb.checked = state.checkedFiles.has(f.path);
-      cb.addEventListener("click", (e) => e.stopPropagation());
-      cb.addEventListener("change", () => {
-        if (cb.checked) state.checkedFiles.add(f.path);
-        else state.checkedFiles.delete(f.path);
-      });
+      const kind = fileKind(f.path);
+      // text と extract はチェックで AI 文脈に入れられる（extract はサーバで Markdown 化）。
+      // other（画像など）はテキスト化の手段が無いのでチェックボックス自体を出さない。
+      if (kind !== "other") {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.title = kind === "text"
+          ? "チャットのコンテキストに含める"
+          : "チャットのコンテキストに含める（テキスト抽出して同梱）";
+        cb.checked = state.checkedFiles.has(f.path);
+        cb.addEventListener("click", (e) => e.stopPropagation());
+        cb.addEventListener("change", () => {
+          if (cb.checked) state.checkedFiles.add(f.path);
+          else state.checkedFiles.delete(f.path);
+        });
+        li.appendChild(cb);
+      } else {
+        const pad = document.createElement("span");
+        pad.className = "cb-pad";  // チェックボックス分の位置を揃えるダミー
+        li.appendChild(pad);
+      }
+      if (kind !== "text") {
+        const icon = document.createElement("span");
+        icon.textContent = fileIcon(f.path);
+        li.appendChild(icon);
+      }
       const name = document.createElement("span");
       name.className = "fname";
       name.textContent = parts[parts.length - 1];
-      name.title = f.path;
-      li.append(cb, name);
+      name.title = kind === "text" ? f.path : `${f.path}（クリックで既定アプリで開く）`;
+      li.append(name);
       li.classList.toggle("active", f.path === state.currentFile);
-      li.addEventListener("click", () => openFile(f.path));
+      // エディタは Markdown/テキスト専用。それ以外は OS の既定アプリに任せる
+      li.addEventListener("click", () =>
+        kind === "text" ? openFile(f.path) : openWithOS(f.path));
     }
     li.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -635,6 +654,27 @@ function isTextRef(r) {
 /** サーバ側で Markdown 抽出して文脈に流せる参照か（Office 文書・PDF）。 */
 function isExtractableRef(r) {
   return extractExts.has(refExt(r));
+}
+
+/** ファイルの扱い方の分類。text=エディタで編集 / extract=OSで開く+AI文脈に抽出可 /
+    other=OSで開くのみ（画像など。テキスト化の手段が無い）。 */
+function fileKind(path) {
+  const ext = (path.split(".").pop() || "").toLowerCase();
+  if (REF_TEXT_EXTS.has(ext)) return "text";
+  if (extractExts.has("." + ext)) return "extract";
+  return "other";
+}
+
+const FILE_ICONS = { pptx: "📊", docx: "📝", xlsx: "📈", pdf: "📕" };
+const fileIcon = (path) => FILE_ICONS[(path.split(".").pop() || "").toLowerCase()] || "📎";
+
+/** ワークスペース内のファイルを OS の既定アプリで開く（pptx や画像はエディタでは開けない）。 */
+async function openWithOS(path) {
+  try {
+    await postJSON("/api/fs/open", { path });
+  } catch (e) {
+    alert("⚠️ 開けませんでした: " + e.message);
+  }
 }
 
 async function loadRefs() {
@@ -1158,8 +1198,10 @@ async function sendChat(presetMessage) {
   const contextPaths = collectContext();
   const context_files = [];
   for (const p of contextPaths) {
-    const r = await (await fetch("/api/file?path=" + encodeURIComponent(p))).json();
-    context_files.push({ path: p, content: r.content });
+    // 抽出失敗（壊れた pptx 等）は理由を alert してそのファイルだけ抜く。
+    // content: undefined のまま送ると /api/chat 側のバリデーションで丸ごと 422 になる。
+    const r = await tryJSON("/api/file?path=" + encodeURIComponent(p));
+    if (r && r.content != null) context_files.push({ path: p, content: r.content });
   }
 
   // チェック済みの関連ファイル: テキストと抽出可能な形式（pptx/docx 等）は内容を文脈へ、
@@ -1669,7 +1711,7 @@ function bindUI() {
     saveFile, openFile, refreshDirty, renderSaveState, scheduleAutosave, flushAutosave,
     loadHistory, saveHistory, clearHistory, AUTOSAVE_DELAY_MS,
     addMessage, renderPatchAction, togglePreview, isPreviewOpen, renderPreview,
-    isTextRef, isExtractableRef, loadSettings,
+    isTextRef, isExtractableRef, loadSettings, fileKind, openWithOS, loadFileList,
   };
 }
 
